@@ -122,6 +122,61 @@ class Preference:
 
 
 @dataclass
+class ShiftDefinition:
+    """Klinikdefinierad passtyp."""
+    id: str
+    name: str
+    function: Function
+    site: str
+    start_time: str = "07:00"
+    end_time: str = "16:30"
+    duration_hours: float = 9.5
+    min_staff: int = 1
+    max_staff: int = 10
+    required_roles: list[Role] = field(default_factory=list)
+    required_competencies: list[str] = field(default_factory=list)
+    is_on_call: bool = False
+
+
+@dataclass
+class ConstraintRule:
+    """Konfigurerbar regel/constraint."""
+    id: str
+    name: str
+    category: str          # "atl", "staffing", "fairness", "preference"
+    is_hard: bool = False  # True = aldrig bryts
+    weight: int = 5        # 1-10 (bara relevant för mjuka)
+    enabled: bool = True
+    parameters: dict = field(default_factory=dict)
+
+
+def default_constraint_rules() -> list[ConstraintRule]:
+    """Standardregler för nya kliniker."""
+    return [
+        ConstraintRule("atl_daily_rest", "11h dygnsvila efter jour", "atl",
+                       is_hard=True, weight=10, parameters={"min_hours": 11}),
+        ConstraintRule("atl_weekly_rest", "36h sammanhängande veckovila", "atl",
+                       is_hard=False, weight=8, parameters={"min_hours": 36}),
+        ConstraintRule("atl_max_weekly_hours", "Max 48h arbete per vecka", "atl",
+                       is_hard=False, weight=7, parameters={"max_hours": 48}),
+        ConstraintRule("call_max_per_week", "Max 1 jour per vecka", "staffing",
+                       is_hard=True, weight=10, parameters={"max_calls": 1}),
+        ConstraintRule("call_weekend_frequency", "Max var 4:e helg med jour", "fairness",
+                       is_hard=False, weight=5, parameters={"min_interval_weeks": 4}),
+        ConstraintRule("staffing_senior_presence", "Minst 1 ÖL aktiv per vardag", "staffing",
+                       is_hard=True, weight=10, parameters={"min_count": 1}),
+        ConstraintRule("training_st_supervisor", "ST med handledare på OP", "preference",
+                       is_hard=False, weight=6, parameters={}),
+        ConstraintRule("call_fairness", "Rättvis jourfördelning", "fairness",
+                       is_hard=False, weight=5, parameters={}),
+        ConstraintRule("preference_site", "Respektera site-preferens", "preference",
+                       is_hard=False, weight=3, parameters={}),
+        ConstraintRule("max_workdays", "Max 5 arbetsdagar per vecka", "atl",
+                       is_hard=True, weight=10, parameters={"max_days": 5}),
+    ]
+
+
+@dataclass
 class ClinicConfig:
     """Komplett klinikkonfiguration — allt solvern behöver."""
     name: str
@@ -132,6 +187,8 @@ class ClinicConfig:
     call_structure: CallStructure
     atl_rules: ATLRules
     preferences: list[Preference]
+    shift_definitions: list[ShiftDefinition] = field(default_factory=list)
+    constraint_rules: list[ConstraintRule] = field(default_factory=default_constraint_rules)
     schedule_cycle_weeks: int = 10
     travel_time_between_sites_min: int = 0
 
@@ -389,6 +446,184 @@ def create_generic_example() -> ClinicConfig:
         atl_rules=ATLRules(),
         preferences=[],
         schedule_cycle_weeks=4,
+    )
+
+
+# === Serialisering ===
+
+def _enum_val(v):
+    return v.value if hasattr(v, 'value') else str(v)
+
+def config_to_dict(config: ClinicConfig) -> dict:
+    """Serialisera ClinicConfig till JSON-kompatibel dict."""
+    return {
+        "name": config.name,
+        "sites": config.sites,
+        "doctors": [
+            {
+                "id": d.id, "name": d.name, "role": _enum_val(d.role),
+                "site_preference": d.site_preference, "employment_rate": d.employment_rate,
+                "can_primary_call": d.can_primary_call, "can_backup_call": d.can_backup_call,
+                "exempt_from_call": d.exempt_from_call, "supervisor_id": d.supervisor_id,
+                "competencies": d.competencies,
+                "required_procedures": d.required_procedures,
+                "completed_procedures": d.completed_procedures,
+            } for d in config.doctors
+        ],
+        "operating_rooms": [
+            {"id": r.id, "site": r.site, "name": r.name, "available_days": r.available_days,
+             "requires_senior": r.requires_senior, "requires_assistant": r.requires_assistant}
+            for r in config.operating_rooms
+        ],
+        "staffing_requirements": [
+            {"function": _enum_val(s.function), "shift_type": _enum_val(s.shift_type),
+             "site": s.site, "min_count": s.min_count,
+             "required_roles": [_enum_val(r) for r in s.required_roles], "min_senior": s.min_senior}
+            for s in config.staffing_requirements
+        ],
+        "call_structure": {
+            "primary_roles": [_enum_val(r) for r in config.call_structure.primary_roles],
+            "backup_roles": [_enum_val(r) for r in config.call_structure.backup_roles],
+            "max_calls_per_month": config.call_structure.max_calls_per_month,
+            "max_consecutive_nights": config.call_structure.max_consecutive_nights,
+            "max_weekend_frequency": config.call_structure.max_weekend_frequency,
+            "rest_after_night": config.call_structure.rest_after_night,
+            "backup_is_on_site": config.call_structure.backup_is_on_site,
+        },
+        "atl_rules": {
+            "min_daily_rest_hours": config.atl_rules.min_daily_rest_hours,
+            "min_weekly_rest_hours": config.atl_rules.min_weekly_rest_hours,
+            "max_weekly_hours": config.atl_rules.max_weekly_hours,
+            "max_consecutive_work_hours": config.atl_rules.max_consecutive_work_hours,
+        },
+        "preferences": [
+            {"doctor_id": p.doctor_id, "type": p.type, "priority": p.priority, "details": p.details}
+            for p in config.preferences
+        ],
+        "shift_definitions": [
+            {"id": s.id, "name": s.name, "function": _enum_val(s.function), "site": s.site,
+             "start_time": s.start_time, "end_time": s.end_time, "duration_hours": s.duration_hours,
+             "min_staff": s.min_staff, "max_staff": s.max_staff,
+             "required_roles": [_enum_val(r) for r in s.required_roles],
+             "required_competencies": s.required_competencies, "is_on_call": s.is_on_call}
+            for s in config.shift_definitions
+        ],
+        "constraint_rules": [
+            {"id": c.id, "name": c.name, "category": c.category,
+             "is_hard": c.is_hard, "weight": c.weight, "enabled": c.enabled,
+             "parameters": c.parameters}
+            for c in config.constraint_rules
+        ],
+        "schedule_cycle_weeks": config.schedule_cycle_weeks,
+        "travel_time_between_sites_min": config.travel_time_between_sites_min,
+    }
+
+
+def _role_from_str(s: str) -> Role:
+    for r in Role:
+        if r.value == s:
+            return r
+    return Role.UNDERLÄKARE
+
+def _func_from_str(s: str) -> Function:
+    for f in Function:
+        if f.value == s:
+            return f
+    return Function.LEDIG
+
+def _shift_from_str(s: str) -> ShiftType:
+    for st in ShiftType:
+        if st.value == s:
+            return st
+    return ShiftType.DAG
+
+
+def dict_to_config(data: dict) -> ClinicConfig:
+    """Deserialisera dict till ClinicConfig."""
+    doctors = [
+        Doctor(
+            id=d["id"], name=d["name"], role=_role_from_str(d["role"]),
+            site_preference=d.get("site_preference"),
+            employment_rate=d.get("employment_rate", 1.0),
+            can_primary_call=d.get("can_primary_call", False),
+            can_backup_call=d.get("can_backup_call", False),
+            exempt_from_call=d.get("exempt_from_call", False),
+            supervisor_id=d.get("supervisor_id"),
+            competencies=d.get("competencies", []),
+            required_procedures=d.get("required_procedures", {}),
+            completed_procedures=d.get("completed_procedures", {}),
+        ) for d in data.get("doctors", [])
+    ]
+    rooms = [
+        OperatingRoom(
+            id=r["id"], site=r["site"], name=r["name"],
+            available_days=r.get("available_days", [0,1,2,3,4]),
+            requires_senior=r.get("requires_senior", True),
+            requires_assistant=r.get("requires_assistant", True),
+        ) for r in data.get("operating_rooms", [])
+    ]
+    staffing = [
+        StaffingRequirement(
+            function=_func_from_str(s["function"]),
+            shift_type=_shift_from_str(s["shift_type"]),
+            site=s["site"], min_count=s["min_count"],
+            required_roles=[_role_from_str(r) for r in s.get("required_roles", [])],
+            min_senior=s.get("min_senior", 0),
+        ) for s in data.get("staffing_requirements", [])
+    ]
+    cs_data = data.get("call_structure", {})
+    call_structure = CallStructure(
+        primary_roles=[_role_from_str(r) for r in cs_data.get("primary_roles", ["ST_SEN", "SP"])],
+        backup_roles=[_role_from_str(r) for r in cs_data.get("backup_roles", ["SP", "ÖL"])],
+        max_calls_per_month=cs_data.get("max_calls_per_month", 4),
+        max_consecutive_nights=cs_data.get("max_consecutive_nights", 1),
+        max_weekend_frequency=cs_data.get("max_weekend_frequency", 4),
+        rest_after_night=cs_data.get("rest_after_night", True),
+        backup_is_on_site=cs_data.get("backup_is_on_site", False),
+    )
+    atl_data = data.get("atl_rules", {})
+    atl = ATLRules(
+        min_daily_rest_hours=atl_data.get("min_daily_rest_hours", 11.0),
+        min_weekly_rest_hours=atl_data.get("min_weekly_rest_hours", 36.0),
+        max_weekly_hours=atl_data.get("max_weekly_hours", 48.0),
+        max_consecutive_work_hours=atl_data.get("max_consecutive_work_hours", 13.0),
+    )
+    prefs = [
+        Preference(p["doctor_id"], p["type"], p.get("priority", 2), p.get("details", {}))
+        for p in data.get("preferences", [])
+    ]
+    shifts = [
+        ShiftDefinition(
+            id=s["id"], name=s["name"], function=_func_from_str(s["function"]),
+            site=s["site"], start_time=s.get("start_time", "07:00"),
+            end_time=s.get("end_time", "16:30"), duration_hours=s.get("duration_hours", 9.5),
+            min_staff=s.get("min_staff", 1), max_staff=s.get("max_staff", 10),
+            required_roles=[_role_from_str(r) for r in s.get("required_roles", [])],
+            required_competencies=s.get("required_competencies", []),
+            is_on_call=s.get("is_on_call", False),
+        ) for s in data.get("shift_definitions", [])
+    ]
+    rules = [
+        ConstraintRule(
+            id=c["id"], name=c["name"], category=c.get("category", ""),
+            is_hard=c.get("is_hard", False), weight=c.get("weight", 5),
+            enabled=c.get("enabled", True), parameters=c.get("parameters", {}),
+        ) for c in data.get("constraint_rules", [])
+    ] if data.get("constraint_rules") else default_constraint_rules()
+
+    return ClinicConfig(
+        name=data["name"],
+        sites=data.get("sites", []),
+        doctors=doctors,
+        operating_rooms=rooms,
+        staffing_requirements=staffing,
+        call_structure=call_structure,
+        atl_rules=atl,
+        preferences=prefs,
+        shift_definitions=shifts,
+        constraint_rules=rules,
+        schedule_cycle_weeks=data.get("schedule_cycle_weeks", 10),
+        travel_time_between_sites_min=data.get("travel_time_between_sites_min", 0),
     )
 
 

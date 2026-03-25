@@ -62,6 +62,14 @@ CREATE TABLE IF NOT EXISTS absence_chains (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS clinic_configs (
+    clinic_id TEXT PRIMARY KEY,
+    data JSONB NOT NULL,
+    version INT DEFAULT 1,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_by TEXT
+);
+
 CREATE TABLE IF NOT EXISTS revoked_tokens (
     token TEXT PRIMARY KEY,
     revoked_at TIMESTAMPTZ DEFAULT NOW(),
@@ -244,14 +252,56 @@ class CopDatabase:
                     data.update(updates)
                     await conn.execute("UPDATE jobs SET data = $1 WHERE job_id = $2", json.dumps(data), job_id)
 
-    async def save_config(self, clinic_id, config_data):
+    async def save_config(self, clinic_id, config_data, user_id=None):
+        """Spara klinikkonfiguration. config_data kan vara ClinicConfig-objekt eller dict."""
         self._configs[clinic_id] = config_data
+        # Persist to PostgreSQL
+        if _pool:
+            from data_model import config_to_dict, ClinicConfig
+            data_dict = config_to_dict(config_data) if isinstance(config_data, ClinicConfig) else config_data
+            async with _pool.acquire() as conn:
+                await conn.execute(
+                    """INSERT INTO clinic_configs (clinic_id, data, updated_by, updated_at)
+                       VALUES ($1, $2, $3, NOW())
+                       ON CONFLICT (clinic_id)
+                       DO UPDATE SET data = $2, version = clinic_configs.version + 1,
+                                     updated_by = $3, updated_at = NOW()""",
+                    clinic_id, json.dumps(data_dict), user_id,
+                )
         return clinic_id
 
     async def get_config(self, clinic_id):
-        return self._configs.get(clinic_id)
+        """Hämta config (minne först, PG som fallback)."""
+        if clinic_id in self._configs:
+            return self._configs[clinic_id]
+        if _pool:
+            async with _pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT data FROM clinic_configs WHERE clinic_id = $1", clinic_id
+                )
+                if row:
+                    from data_model import dict_to_config
+                    config = dict_to_config(json.loads(row["data"]))
+                    self._configs[clinic_id] = config
+                    return config
+        return None
+
+    async def delete_config(self, clinic_id):
+        """Ta bort klinikkonfiguration."""
+        self._configs.pop(clinic_id, None)
+        if _pool:
+            async with _pool.acquire() as conn:
+                await conn.execute("DELETE FROM clinic_configs WHERE clinic_id = $1", clinic_id)
 
     async def list_configs(self):
+        """Lista alla klinikkonfigurationer."""
+        # Load from PG if memory is empty
+        if not self._configs and _pool:
+            async with _pool.acquire() as conn:
+                rows = await conn.fetch("SELECT clinic_id, data FROM clinic_configs")
+                for row in rows:
+                    from data_model import dict_to_config
+                    self._configs[row["clinic_id"]] = dict_to_config(json.loads(row["data"]))
         result = []
         for clinic_id, config in self._configs.items():
             result.append({

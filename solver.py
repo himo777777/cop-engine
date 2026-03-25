@@ -23,7 +23,7 @@ from collections import defaultdict
 from ortools.sat.python import cp_model
 
 from data_model import (
-    ClinicConfig, Role, ShiftType, Function,
+    ClinicConfig, Role, ShiftType, Function, ConstraintRule,
     create_kristianstad_example,
 )
 
@@ -41,6 +41,23 @@ FUNC_NAMES = {
 }
 
 DAY_NAMES = ["Mån", "Tis", "Ons", "Tor", "Fre", "Lör", "Sön"]
+
+
+def _get_rule(config: ClinicConfig, rule_id: str, default_weight: int = 5):
+    """Hämta regel från config. Returnerar (enabled, is_hard, weight)."""
+    for rule in getattr(config, 'constraint_rules', []):
+        if rule.id == rule_id and rule.enabled:
+            return (True, rule.is_hard, rule.weight)
+    return (False, False, default_weight)
+
+
+def _rule_weight(config: ClinicConfig, rule_id: str, default: int = 5) -> int:
+    """Hämta mjuk-vikt för en regel. Returnerar 0 om inaktiverad."""
+    enabled, is_hard, weight = _get_rule(config, rule_id, default)
+    if not enabled:
+        return 0
+    # Skala vikt: config weight 1-10 → solver multiplier
+    return weight * 2  # weight 5 → 10, weight 10 → 20
 
 
 def _build_functions(config: ClinicConfig):
@@ -421,25 +438,28 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
                 if site == doc.site_preference and (doc.id, day, func_id) in x:
                     site_pref_bonus.append(x[(doc.id, day, func_id)])
 
-    # === OBJEKTIV FUNKTION ===
+    # === OBJEKTIV FUNKTION (vikter från config.constraint_rules) ===
+    w_training = _rule_weight(config, "training_st_supervisor", 6)
+    w_fairness = _rule_weight(config, "call_fairness", 5)
+    w_rest = _rule_weight(config, "atl_weekly_rest", 8)
+    w_weekend = _rule_weight(config, "call_weekend_frequency", 5)
+    w_site = _rule_weight(config, "preference_site", 3)
+
     objective_terms = []
     for bonus_var in st_training_bonus:
-        objective_terms.append(15 * bonus_var)  # ST-träning (höjd från 10)
+        objective_terms.append(w_training * bonus_var)
     for pref_term in preference_bonus:
         objective_terms.append(pref_term)
-    if call_counts:
+    if call_counts and w_fairness:
         call_spread = model.new_int_var(0, num_days, "call_spread")
         model.add(call_spread == max_calls - min_calls)
-        objective_terms.append(-5 * call_spread)
-    # Veckovila: bonus för att ha den (+20 per vecka med vila)
+        objective_terms.append(-w_fairness * call_spread)
     for rest_var in weekly_rest_violations:
-        objective_terms.append(20 * rest_var)
-    # Helgfrekvens: penalty (-10 per brott)
+        objective_terms.append(w_rest * rest_var)
     for wknd_var in weekend_penalties:
-        objective_terms.append(-10 * wknd_var)
-    # Site preference: bonus (+5 per matchande dag)
+        objective_terms.append(-w_weekend * wknd_var)
     for sp_var in site_pref_bonus:
-        objective_terms.append(5 * sp_var)
+        objective_terms.append(w_site * sp_var)
 
     if objective_terms:
         model.maximize(sum(objective_terms))

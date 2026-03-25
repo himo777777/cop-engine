@@ -295,34 +295,105 @@ async def get_config_by_id(clinic_id: str):
     if not config:
         raise HTTPException(status_code=404, detail=f"Klinik '{clinic_id}' finns inte")
 
-    return {
-        "clinic_id": clinic_id,
-        "doctors": [
-            {
-                "id": d.id,
-                "name": d.name,
-                "role": d.role.value,
-                "employment_percent": d.employment_rate,
-                "can_primary_call": d.can_primary_call,
-                "can_backup_call": d.can_backup_call,
-                "exempt_from_call": d.exempt_from_call,
-                "supervisor_id": d.supervisor_id,
-            }
-            for d in config.doctors
-        ],
-        "operating_rooms": [
-            {
-                "id": r.id,
-                "name": r.name,
-                "site": r.site,
-                "available_days": r.available_days,
-            }
-            for r in config.operating_rooms
-        ],
-        "sites": config.sites,
-        "num_doctors": len(config.doctors),
-        "num_rooms": len(config.operating_rooms),
-    }
+    from data_model import config_to_dict
+    result = config_to_dict(config)
+    result["clinic_id"] = clinic_id
+    result["num_doctors"] = len(config.doctors)
+    result["num_rooms"] = len(config.operating_rooms)
+    return result
+
+
+# === CONFIG CRUD ===
+
+class ClinicConfigInput(BaseModel):
+    """Input for creating/updating a clinic config."""
+    name: str
+    sites: list[str]
+    doctors: list[dict] = []
+    operating_rooms: list[dict] = []
+    staffing_requirements: list[dict] = []
+    call_structure: dict = {}
+    atl_rules: dict = {}
+    preferences: list[dict] = []
+    shift_definitions: list[dict] = []
+    constraint_rules: list[dict] = []
+    schedule_cycle_weeks: int = 10
+    travel_time_between_sites_min: int = 0
+
+@app.post("/config", tags=["Konfiguration"])
+async def create_config(clinic_id: str, body: ClinicConfigInput):
+    """Skapa ny klinikkonfiguration."""
+    existing = await db.get_config(clinic_id)
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Klinik '{clinic_id}' finns redan")
+    from data_model import dict_to_config
+    config = dict_to_config(body.model_dump())
+    await db.save_config(clinic_id, config)
+    await db.audit("config_created", details={"clinic_id": clinic_id})
+    return {"status": "created", "clinic_id": clinic_id}
+
+@app.put("/config/{clinic_id}", tags=["Konfiguration"])
+async def update_config(clinic_id: str, body: ClinicConfigInput):
+    """Uppdatera hela klinikkonfigurationen."""
+    existing = await db.get_config(clinic_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Klinik '{clinic_id}' finns inte")
+    from data_model import dict_to_config
+    config = dict_to_config(body.model_dump())
+    await db.save_config(clinic_id, config)
+    await db.audit("config_updated", details={"clinic_id": clinic_id})
+    return {"status": "updated", "clinic_id": clinic_id}
+
+@app.patch("/config/{clinic_id}/doctors", tags=["Konfiguration"])
+async def patch_doctors(clinic_id: str, doctors: list[dict]):
+    """Uppdatera bara lakarlistan."""
+    config = await db.get_config(clinic_id)
+    if not config:
+        raise HTTPException(status_code=404, detail=f"Klinik '{clinic_id}' finns inte")
+    from data_model import config_to_dict, dict_to_config
+    data = config_to_dict(config)
+    data["doctors"] = doctors
+    new_config = dict_to_config(data)
+    await db.save_config(clinic_id, new_config)
+    await db.audit("config_doctors_updated", details={"clinic_id": clinic_id, "count": len(doctors)})
+    return {"status": "updated", "doctors": len(doctors)}
+
+@app.patch("/config/{clinic_id}/rules", tags=["Konfiguration"])
+async def patch_rules(clinic_id: str, rules: list[dict]):
+    """Uppdatera regler/constraints."""
+    config = await db.get_config(clinic_id)
+    if not config:
+        raise HTTPException(status_code=404, detail=f"Klinik '{clinic_id}' finns inte")
+    from data_model import config_to_dict, dict_to_config
+    data = config_to_dict(config)
+    data["constraint_rules"] = rules
+    new_config = dict_to_config(data)
+    await db.save_config(clinic_id, new_config)
+    await db.audit("config_rules_updated", details={"clinic_id": clinic_id, "count": len(rules)})
+    return {"status": "updated", "rules": len(rules)}
+
+@app.patch("/config/{clinic_id}/shifts", tags=["Konfiguration"])
+async def patch_shifts(clinic_id: str, shifts: list[dict]):
+    """Uppdatera passtyper."""
+    config = await db.get_config(clinic_id)
+    if not config:
+        raise HTTPException(status_code=404, detail=f"Klinik '{clinic_id}' finns inte")
+    from data_model import config_to_dict, dict_to_config
+    data = config_to_dict(config)
+    data["shift_definitions"] = shifts
+    new_config = dict_to_config(data)
+    await db.save_config(clinic_id, new_config)
+    return {"status": "updated", "shifts": len(shifts)}
+
+@app.delete("/config/{clinic_id}", tags=["Konfiguration"])
+async def delete_config(clinic_id: str):
+    """Ta bort klinikkonfiguration."""
+    existing = await db.get_config(clinic_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Klinik '{clinic_id}' finns inte")
+    await db.delete_config(clinic_id)
+    await db.audit("config_deleted", details={"clinic_id": clinic_id})
+    return {"status": "deleted", "clinic_id": clinic_id}
 
 
 # === SCHEMAGENERERING ===
