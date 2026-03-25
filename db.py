@@ -82,6 +82,32 @@ CREATE INDEX IF NOT EXISTS idx_chains_status ON absence_chains(status);
 CREATE INDEX IF NOT EXISTS idx_chains_created ON absence_chains(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_revoked_expires ON revoked_tokens(expires_at);
+
+
+-- Migration: ensure columns exist for upgraded schema
+DO $$ BEGIN
+  ALTER TABLE jobs ADD COLUMN IF NOT EXISTS data JSONB;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  ALTER TABLE schedules ADD COLUMN IF NOT EXISTS data JSONB;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  ALTER TABLE absence_chains ADD COLUMN IF NOT EXISTS data JSONB;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+-- Drop old columns if they exist (from initial schema)
+DO $$ BEGIN
+  ALTER TABLE jobs DROP COLUMN IF EXISTS params;
+  ALTER TABLE jobs DROP COLUMN IF EXISTS result;
+  ALTER TABLE jobs DROP COLUMN IF EXISTS status;
+  ALTER TABLE jobs DROP COLUMN IF EXISTS updated_at;
+EXCEPTION WHEN undefined_column THEN NULL;
+END $$;
 """
 
 
