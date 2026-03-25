@@ -1,11 +1,14 @@
 __pycache__/
 *.pyc
 .env
+node_modules/
 .pytest_cache/
 pytest-cache-files-*
 *.egg-info/
+venv/
+.venv/
 dist/
 build/
 .vercel/
-node_modules/
+mongo-init/
 validation_results_*.json
