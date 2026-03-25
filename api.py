@@ -43,6 +43,26 @@ from solver import solve_schedule
 from absence_chain import AbsenceChain, AbsenceChainResult, ChainStatus
 from db import get_db, connect_db, close_db
 
+# PDF Export & Email Notifications
+try:
+    from pdf_export import pdf_router
+    HAS_PDF = True
+except ImportError:
+    HAS_PDF = False
+
+try:
+    from email_service import email_router
+    HAS_EMAIL = True
+except ImportError:
+    HAS_EMAIL = False
+
+# Security
+try:
+    from security import setup_security
+    HAS_SECURITY = True
+except ImportError:
+    HAS_SECURITY = False
+
 # Auth & WebSocket integration
 try:
     from auth import auth_router, get_current_user, require_role, require_permission, Role as AuthRole
@@ -80,8 +100,16 @@ if HAS_AUTH:
     app.include_router(auth_router)
 if HAS_WS:
     app.include_router(ws_router)
+if HAS_PDF:
+    app.include_router(pdf_router)
+if HAS_EMAIL:
+    app.include_router(email_router)
 
-# === DATABASE LAYER (MongoDB med in-memory fallback) ===
+# Security middleware
+if HAS_SECURITY:
+    setup_security(app)
+
+# === DATABASE LAYER (PostgreSQL med in-memory fallback) ===
 db = get_db()
 
 # Bakåtkompatibla alias — synkron åtkomst för _run_solver (kör i thread)
@@ -190,8 +218,8 @@ START_TIME = time.time()
 @app.on_event("startup")
 async def startup():
     """Anslut till MongoDB och ladda demo-konfiguration om COP_DEMO=true."""
-    mongo_ok = await connect_db()
-    backend = "MongoDB" if mongo_ok else "in-memory"
+    db_ok = await connect_db()
+    backend = "PostgreSQL" if db_ok else "in-memory"
 
     demo_mode = os.environ.get("COP_DEMO", "true").lower() in ("true", "1", "yes")
     if demo_mode:
@@ -205,7 +233,7 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    """Stäng MongoDB-anslutning."""
+    """Stäng databasanslutning."""
     await close_db()
 
 

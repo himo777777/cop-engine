@@ -109,7 +109,7 @@ async def connect_db():
         )
         async with _pool.acquire() as conn:
             await conn.execute(SCHEMA_SQL)
-        logger.info("PostgreSQL connected, tables created")
+        logger.info(f"PostgreSQL connected, tables created")
         return True
     except Exception as e:
         logger.warning(f"PostgreSQL unavailable ({e}), using in-memory fallback")
@@ -172,6 +172,7 @@ class CopDatabase:
         return sid
 
     async def get_schedule(self, schedule_id: str) -> Optional[dict]:
+        # Check memory first
         if schedule_id in self._schedules:
             return self._schedules[schedule_id]
         if _pool:

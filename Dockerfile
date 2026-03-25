@@ -9,6 +9,11 @@ FROM python:3.11-slim
 RUN groupadd -r cop && useradd -r -g cop -m cop
 WORKDIR /app
 
+# Runtime deps for reportlab/weasyprint
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /install /usr/local
 COPY *.py .
 COPY adapters/ ./adapters/
