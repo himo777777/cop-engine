@@ -91,6 +91,37 @@ CREATE INDEX IF NOT EXISTS idx_chains_created ON absence_chains(created_at DESC)
 CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_revoked_expires ON revoked_tokens(expires_at);
 
+CREATE TABLE IF NOT EXISTS ai_rules (
+    id SERIAL PRIMARY KEY,
+    clinic_id TEXT NOT NULL,
+    rule_text TEXT NOT NULL,
+    parsed JSONB,
+    confidence REAL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS ai_chat_history (
+    id SERIAL PRIMARY KEY,
+    clinic_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    message TEXT NOT NULL,
+    response TEXT,
+    action JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS ai_predictions (
+    id SERIAL PRIMARY KEY,
+    clinic_id TEXT NOT NULL,
+    period TEXT,
+    predictions JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_rules_clinic ON ai_rules(clinic_id);
+CREATE INDEX IF NOT EXISTS idx_ai_chat_clinic ON ai_chat_history(clinic_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_pred_clinic ON ai_predictions(clinic_id);
+
 
 -- Migration: ensure columns exist for upgraded schema
 DO $$ BEGIN
@@ -429,6 +460,39 @@ class CopDatabase:
                 c_count = await conn.fetchval("SELECT COUNT(*) FROM absence_chains")
                 return {"backend": "postgresql", "schedules": s_count, "users": u_count, "chains": c_count}
         return {"backend": "in-memory", "schedules": len(self._schedules), "users": len(self._users), "chains": len(self._chains)}
+
+
+    # ---- AI TABLES ---------------------------------------------------------
+
+    async def save_ai_rule(self, clinic_id, rule_text, parsed, confidence):
+        if _pool:
+            async with _pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO ai_rules (clinic_id, rule_text, parsed, confidence) VALUES ($1,$2,$3,$4)",
+                    clinic_id, rule_text, json.dumps(parsed), confidence)
+
+    async def save_ai_chat(self, clinic_id, user_id, message, response, action=None):
+        if _pool:
+            async with _pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO ai_chat_history (clinic_id, user_id, message, response, action) VALUES ($1,$2,$3,$4,$5)",
+                    clinic_id, user_id, message, response, json.dumps(action) if action else None)
+
+    async def get_ai_chat_history(self, clinic_id, user_id, limit=20):
+        if _pool:
+            async with _pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT message, response, action FROM ai_chat_history WHERE clinic_id=$1 AND user_id=$2 ORDER BY created_at DESC LIMIT $3",
+                    clinic_id, user_id, limit)
+                return [{"message": r["message"], "response": r["response"], "action": json.loads(r["action"]) if r["action"] else None} for r in reversed(rows)]
+        return []
+
+    async def save_ai_prediction(self, clinic_id, period, predictions):
+        if _pool:
+            async with _pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO ai_predictions (clinic_id, period, predictions) VALUES ($1,$2,$3)",
+                    clinic_id, period, json.dumps(predictions))
 
 
 _instance = None

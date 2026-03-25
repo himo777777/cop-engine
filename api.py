@@ -396,6 +396,87 @@ async def delete_config(clinic_id: str):
     return {"status": "deleted", "clinic_id": clinic_id}
 
 
+# === AI ENDPOINTS ===
+
+class AIRuleRequest(BaseModel):
+    clinic_id: str
+    rule_text: str
+
+class AIChatRequest(BaseModel):
+    clinic_id: str
+    user_id: str
+    message: str
+
+class AIExplainRequest(BaseModel):
+    schedule_id: str
+    doctor_id: str
+    shift_date: str
+
+class AIPredictRequest(BaseModel):
+    clinic_id: str
+    period_start: str
+    period_end: str
+
+class AIConflictRequest(BaseModel):
+    clinic_id: str
+    new_rule: dict
+
+@app.post("/api/ai/rules/parse", tags=["AI"])
+async def ai_parse_rule(req: AIRuleRequest):
+    config = await db.get_config(req.clinic_id)
+    if not config:
+        raise HTTPException(status_code=404, detail=f"Klinik '{req.clinic_id}' finns inte")
+    from ai_rules import parse_rule
+    result = await parse_rule(config, req.rule_text, clinic_id=req.clinic_id)
+    if result.get("constraint") and not result.get("error"):
+        await db.save_ai_rule(req.clinic_id, req.rule_text, result["constraint"], result["confidence"])
+    return result
+
+@app.post("/api/ai/conflicts/check", tags=["AI"])
+async def ai_check_conflicts(req: AIConflictRequest):
+    config = await db.get_config(req.clinic_id)
+    if not config:
+        raise HTTPException(status_code=404, detail=f"Klinik '{req.clinic_id}' finns inte")
+    from ai_conflicts import check_conflicts
+    return await check_conflicts(config, req.new_rule, clinic_id=req.clinic_id)
+
+@app.post("/api/ai/explain", tags=["AI"])
+async def ai_explain(req: AIExplainRequest):
+    sched = await db.get_schedule(req.schedule_id)
+    if not sched:
+        raise HTTPException(status_code=404, detail="Schema inte hittat")
+    config = await db.get_config(sched.get("clinic_id", ""))
+    if not config:
+        raise HTTPException(status_code=404, detail="Klinik-config saknas")
+    from ai_explain import explain_assignment
+    return await explain_assignment(config, sched, req.doctor_id, req.shift_date, clinic_id=sched.get("clinic_id", ""))
+
+@app.post("/api/ai/predict/absence", tags=["AI"])
+async def ai_predict(req: AIPredictRequest):
+    config = await db.get_config(req.clinic_id)
+    if not config:
+        raise HTTPException(status_code=404, detail=f"Klinik '{req.clinic_id}' finns inte")
+    chains = await db.list_chains(limit=200)
+    from ai_predict import predict_absence
+    result = await predict_absence(chains, req.period_start, req.period_end, len(config.doctors), clinic_id=req.clinic_id)
+    if not result.get("error"):
+        await db.save_ai_prediction(req.clinic_id, f"{req.period_start}_{req.period_end}", result)
+    return result
+
+@app.post("/api/ai/chat", tags=["AI"])
+async def ai_chat_endpoint(req: AIChatRequest):
+    config = await db.get_config(req.clinic_id)
+    if not config:
+        raise HTTPException(status_code=404, detail=f"Klinik '{req.clinic_id}' finns inte")
+    schedules = await db.list_schedules(clinic_id=req.clinic_id, limit=1)
+    latest = await db.get_schedule(schedules[0]["schedule_id"]) if schedules else {}
+    history = await db.get_ai_chat_history(req.clinic_id, req.user_id, limit=10)
+    from ai_chat import chat
+    result = await chat(config, latest, req.user_id, req.message, chat_history=history, clinic_id=req.clinic_id)
+    await db.save_ai_chat(req.clinic_id, req.user_id, req.message, result.get("response_sv", ""), result.get("action"))
+    return result
+
+
 # === SCHEMAGENERERING ===
 
 def _run_solver(job_id: str, config: ClinicConfig, request: ScheduleRequest):
