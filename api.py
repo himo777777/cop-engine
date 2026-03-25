@@ -1,23 +1,23 @@
 """
-COP REST API v0.1 — Clinical Operations Protocol
+COP REST API v0.1 â Clinical Operations Protocol
 =================================================
-FastAPI-baserat API för AI-driven schemaoptimering.
+FastAPI-baserat API fÃ¶r AI-driven schemaoptimering.
 
 Endpoints:
-  POST /schedule/generate     — Generera optimalt schema
-  GET  /schedule/{id}         — Hämta genererat schema
-  POST /schedule/adjust       — Manuell justering (byte, frånvaro)
-  POST /schedule/reoptimize   — Omoptimera efter ändring
-  GET  /health                — Hälsocheck
-  GET  /config                — Hämta aktiv klinikkonfiguration
-  PUT  /config                — Uppdatera klinikkonfiguration
-  POST /absence               — Registrera frånvaro
-  GET  /statistics/{id}       — Hämta schemastatistik
-  POST /validate              — Validera schema mot ATL
+  POST /schedule/generate     â Generera optimalt schema
+  GET  /schedule/{id}         â HÃ¤mta genererat schema
+  POST /schedule/adjust       â Manuell justering (byte, frÃ¥nvaro)
+  POST /schedule/reoptimize   â Omoptimera efter Ã¤ndring
+  GET  /health                â HÃ¤lsocheck
+  GET  /config                â HÃ¤mta aktiv klinikkonfiguration
+  PUT  /config                â Uppdatera klinikkonfiguration
+  POST /absence               â Registrera frÃ¥nvaro
+  GET  /statistics/{id}       â HÃ¤mta schemastatistik
+  POST /validate              â Validera schema mot ATL
 
 Arkitektur:
-  Browser/Tessa/TimeCase → [REST API] → [COP Solver] → [Optimalt Schema]
-                                ↓
+  Browser/Tessa/TimeCase â [REST API] â [COP Solver] â [Optimalt Schema]
+                                â
                          [Schedule Store]
 """
 
@@ -43,6 +43,26 @@ from solver import solve_schedule
 from absence_chain import AbsenceChain, AbsenceChainResult, ChainStatus
 from db import get_db, connect_db, close_db
 
+# PDF Export & Email Notifications
+try:
+    from pdf_export import pdf_router
+    HAS_PDF = True
+except ImportError:
+    HAS_PDF = False
+
+try:
+    from email_service import email_router
+    HAS_EMAIL = True
+except ImportError:
+    HAS_EMAIL = False
+
+# Security
+try:
+    from security import setup_security
+    HAS_SECURITY = True
+except ImportError:
+    HAS_SECURITY = False
+
 # Auth & WebSocket integration
 try:
     from auth import auth_router, get_current_user, require_role, require_permission, Role as AuthRole
@@ -58,8 +78,8 @@ except ImportError:
 
 # === APP SETUP ===
 app = FastAPI(
-    title="COP — Clinical Operations Protocol",
-    description="AI-driven schemaoptimering för sjukvården. System-agnostisk motor som pluggar in i Tessa, Time Care, Heroma, Medvind.",
+    title="COP â Clinical Operations Protocol",
+    description="AI-driven schemaoptimering fÃ¶r sjukvÃ¥rden. System-agnostisk motor som pluggar in i Tessa, Time Care, Heroma, Medvind.",
     version="0.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
@@ -81,11 +101,20 @@ if HAS_AUTH:
 if HAS_WS:
     app.include_router(ws_router)
 
-# === DATABASE LAYER (MongoDB med in-memory fallback) ===
+if HAS_PDF:
+    app.include_router(pdf_router)
+if HAS_EMAIL:
+    app.include_router(email_router)
+
+# Security middleware
+if HAS_SECURITY:
+    setup_security(app)
+
+# === DATABASE LAYER (PostgreSQL med in-memory fallback) ===
 db = get_db()
 
-# Bakåtkompatibla alias — synkron åtkomst för _run_solver (kör i thread)
-# Dessa wrappas till async i endpoints, men solver-tråden behöver synkron access
+# BakÃ¥tkompatibla alias â synkron Ã¥tkomst fÃ¶r _run_solver (kÃ¶r i thread)
+# Dessa wrappas till async i endpoints, men solver-trÃ¥den behÃ¶ver synkron access
 schedule_store = db._schedules  # direct dict reference for backward compat in sync code
 config_store = db._configs
 job_store = db._jobs
@@ -94,13 +123,13 @@ job_store = db._jobs
 # === PYDANTIC MODELLER (API-kontrakt) ===
 
 class ScheduleRequest(BaseModel):
-    """Begäran om att generera ett nytt schema."""
+    """BegÃ¤ran om att generera ett nytt schema."""
     clinic_id: str = Field(description="Klinik-ID")
-    num_weeks: int = Field(default=2, ge=1, le=8, description="Antal veckor att schemalägga")
-    start_date: Optional[str] = Field(default=None, description="Startdatum (YYYY-MM-DD), default=nästa måndag")
-    time_limit_seconds: int = Field(default=30, ge=5, le=300, description="Max tid för solver")
-    locked_assignments: Optional[dict] = Field(default=None, description="Låsta tilldelningar {doctor_id: {day: function}}")
-    excluded_doctors: Optional[list[str]] = Field(default=None, description="Läkar-ID som inte ska schemaläggas")
+    num_weeks: int = Field(default=2, ge=1, le=8, description="Antal veckor att schemalÃ¤gga")
+    start_date: Optional[str] = Field(default=None, description="Startdatum (YYYY-MM-DD), default=nÃ¤sta mÃ¥ndag")
+    time_limit_seconds: int = Field(default=30, ge=5, le=300, description="Max tid fÃ¶r solver")
+    locked_assignments: Optional[dict] = Field(default=None, description="LÃ¥sta tilldelningar {doctor_id: {day: function}}")
+    excluded_doctors: Optional[list[str]] = Field(default=None, description="LÃ¤kar-ID som inte ska schemalÃ¤ggas")
 
 
 class ScheduleResponse(BaseModel):
@@ -119,7 +148,7 @@ class ScheduleResponse(BaseModel):
 
 
 class AdjustmentRequest(BaseModel):
-    """Begäran om att justera ett befintligt schema."""
+    """BegÃ¤ran om att justera ett befintligt schema."""
     schedule_id: str
     adjustment_type: str  # "swap", "replace", "lock", "unlock"
     doctor_id: str
@@ -130,20 +159,20 @@ class AdjustmentRequest(BaseModel):
 
 
 class AbsenceRequest(BaseModel):
-    """Registrera frånvaro för en läkare."""
+    """Registrera frÃ¥nvaro fÃ¶r en lÃ¤kare."""
     clinic_id: str
     doctor_id: str
     absence_type: str  # "sjuk", "semester", "vab", "utbildning", "konferens"
     start_date: str  # YYYY-MM-DD
     end_date: str    # YYYY-MM-DD
     reason: Optional[str] = None
-    reoptimize: bool = Field(default=True, description="Auto-omoptimera berörda scheman?")
+    reoptimize: bool = Field(default=True, description="Auto-omoptimera berÃ¶rda scheman?")
 
 
 class ReoptimizeRequest(BaseModel):
-    """Begäran om omoptimering av befintligt schema."""
+    """BegÃ¤ran om omoptimering av befintligt schema."""
     schedule_id: str
-    preserve_locked: bool = Field(default=True, description="Behåll låsta tilldelningar?")
+    preserve_locked: bool = Field(default=True, description="BehÃ¥ll lÃ¥sta tilldelningar?")
     time_limit_seconds: int = Field(default=30)
 
 
@@ -156,10 +185,10 @@ class ValidationResult(BaseModel):
 
 
 class DoctorInput(BaseModel):
-    """Läkarinput för API."""
+    """LÃ¤karinput fÃ¶r API."""
     id: str
     name: str
-    role: str  # UL, ST_TIDIG, ST_SEN, SP, ÖL
+    role: str  # UL, ST_TIDIG, ST_SEN, SP, ÃL
     employment_percent: int = 100
     can_primary_call: bool = False
     can_backup_call: bool = False
@@ -172,11 +201,11 @@ class ConfigUpdate(BaseModel):
     """Uppdatering av klinikkonfiguration."""
     clinic_id: str
     doctors: Optional[list[DoctorInput]] = None
-    # Fler config-fält kan läggas till
+    # Fler config-fÃ¤lt kan lÃ¤ggas till
 
 
 class HealthResponse(BaseModel):
-    """Hälsocheck-svar."""
+    """HÃ¤lsocheck-svar."""
     status: str
     version: str
     uptime_seconds: float
@@ -189,9 +218,9 @@ START_TIME = time.time()
 
 @app.on_event("startup")
 async def startup():
-    """Anslut till MongoDB och ladda demo-konfiguration om COP_DEMO=true."""
-    mongo_ok = await connect_db()
-    backend = "MongoDB" if mongo_ok else "in-memory"
+    """Anslut till PostgreSQL och ladda demo-konfiguration om COP_DEMO=true."""
+    db_ok = await connect_db()
+    backend = "PostgreSQL" if db_ok else "in-memory"
 
     demo_mode = os.environ.get("COP_DEMO", "true").lower() in ("true", "1", "yes")
     if demo_mode:
@@ -199,13 +228,13 @@ async def startup():
         await db.save_config("kristianstad", config)
         generic = create_generic_example()
         await db.save_config("generic", generic)
-        print(f"✅ COP API startad. Backend: {backend}. Demo-konfigurationer laddade (kristianstad, generic).")
+        print(f"â COP API startad. Backend: {backend}. Demo-konfigurationer laddade (kristianstad, generic).")
     else:
-        print(f"✅ COP API startad. Backend: {backend}. Inga demo-konfigurationer (COP_DEMO=false).")
+        print(f"â COP API startad. Backend: {backend}. Inga demo-konfigurationer (COP_DEMO=false).")
 
 @app.on_event("shutdown")
 async def shutdown():
-    """Stäng MongoDB-anslutning."""
+    """StÃ¤ng MongoDB-anslutning."""
     await close_db()
 
 
@@ -225,7 +254,7 @@ async def health_check():
 
 @app.get("/config", tags=["Konfiguration"])
 async def get_default_config(clinic_id: Optional[str] = None):
-    """Hämta klinikkonfiguration. Utan clinic_id returneras första tillgängliga."""
+    """HÃ¤mta klinikkonfiguration. Utan clinic_id returneras fÃ¶rsta tillgÃ¤ngliga."""
     if not clinic_id:
         configs = await db.list_configs()
         if not configs:
@@ -235,14 +264,14 @@ async def get_default_config(clinic_id: Optional[str] = None):
 
 @app.get("/configs", tags=["Konfiguration"])
 async def list_configs():
-    """Lista alla tillgängliga klinikkonfigurationer."""
+    """Lista alla tillgÃ¤ngliga klinikkonfigurationer."""
     configs = await db.list_configs()
     return configs
 
 
 @app.get("/statistics", tags=["Statistik"])
 async def get_latest_statistics():
-    """Hämta statistik för senaste schemat."""
+    """HÃ¤mta statistik fÃ¶r senaste schemat."""
     schedules = await db.list_schedules(limit=1)
     if not schedules:
         return {"total_doctors": 0, "atl_violations": 0, "weeks": 0,
@@ -257,7 +286,7 @@ async def get_latest_statistics():
 
 @app.get("/config/{clinic_id}", tags=["Konfiguration"])
 async def get_config_by_id(clinic_id: str):
-    """Hämta klinikkonfiguration."""
+    """HÃ¤mta klinikkonfiguration."""
     config = await db.get_config(clinic_id)
     if not config:
         raise HTTPException(status_code=404, detail=f"Klinik '{clinic_id}' finns inte")
@@ -295,7 +324,7 @@ async def get_config_by_id(clinic_id: str):
 # === SCHEMAGENERERING ===
 
 def _run_solver(job_id: str, config: ClinicConfig, request: ScheduleRequest):
-    """Kör solver i bakgrunden."""
+    """KÃ¶r solver i bakgrunden."""
     try:
         job_store[job_id]["status"] = "running"
         start_time = time.time()
@@ -310,10 +339,10 @@ def _run_solver(job_id: str, config: ClinicConfig, request: ScheduleRequest):
 
         if schedule is None:
             job_store[job_id]["status"] = "infeasible"
-            job_store[job_id]["error"] = "Ingen giltig lösning hittades"
+            job_store[job_id]["error"] = "Ingen giltig lÃ¶sning hittades"
             return
 
-        # Beräkna startdatum
+        # BerÃ¤kna startdatum
         if request.start_date:
             start = datetime.strptime(request.start_date, "%Y-%m-%d").date()
         else:
@@ -323,7 +352,7 @@ def _run_solver(job_id: str, config: ClinicConfig, request: ScheduleRequest):
                 days_until_monday = 7
             start = today + timedelta(days=days_until_monday)
 
-        # Beräkna statistik
+        # BerÃ¤kna statistik
         statistics = _compute_statistics(schedule, config, request.num_weeks * 7)
 
         # Konvertera schedule till datum-baserat format
@@ -344,7 +373,7 @@ def _run_solver(job_id: str, config: ClinicConfig, request: ScheduleRequest):
             "created_at": datetime.now().isoformat(),
             "solve_time_ms": solve_time_ms,
             "schedule": date_schedule,
-            "raw_schedule": schedule,  # Indexbaserat för intern användning
+            "raw_schedule": schedule,  # Indexbaserat fÃ¶r intern anvÃ¤ndning
             "statistics": statistics,
             "warnings": [],
         }
@@ -353,8 +382,8 @@ def _run_solver(job_id: str, config: ClinicConfig, request: ScheduleRequest):
         job_store[job_id]["status"] = "completed"
         job_store[job_id]["result"] = schedule_data
 
-        # Persist to MongoDB if available (async from sync context)
-        if db.using_mongo:
+        # Persist to DB if available (async from sync context)
+        if db.using_postgres:
             import asyncio
             try:
                 loop = asyncio.get_event_loop()
@@ -384,7 +413,7 @@ def _run_solver(job_id: str, config: ClinicConfig, request: ScheduleRequest):
 
 
 def _compute_statistics(schedule: dict, config: ClinicConfig, num_days: int) -> dict:
-    """Beräkna schemastatistik."""
+    """BerÃ¤kna schemastatistik."""
     doc_by_id = {d.id: d for d in config.doctors}
     stats = {
         "call_distribution": {},
@@ -394,7 +423,7 @@ def _compute_statistics(schedule: dict, config: ClinicConfig, num_days: int) -> 
         "workload_balance": {},
     }
 
-    # Jourfördelning
+    # JourfÃ¶rdelning
     for doc in config.doctors:
         primary = sum(1 for d in range(num_days) if schedule.get(doc.id, {}).get(d) == "JOUR_P")
         backup = sum(1 for d in range(num_days) if schedule.get(doc.id, {}).get(d) == "JOUR_B")
@@ -446,7 +475,7 @@ def _compute_statistics(schedule: dict, config: ClinicConfig, num_days: int) -> 
                     "doctor_id": doc.id,
                     "doctor_name": doc.name,
                     "day": day,
-                    "violation": f"Jour dag {day+1} → arbete dag {day+2}",
+                    "violation": f"Jour dag {day+1} â arbete dag {day+2}",
                 })
 
     # Arbetsbelastning (antal arbetsdagar)
@@ -469,8 +498,8 @@ async def generate_schedule(request: ScheduleRequest, background_tasks: Backgrou
     """
     Generera ett nytt optimerat schema.
 
-    Startar solver i bakgrunden. Returnerar job_id för polling.
-    Alternativt: om time_limit <= 60s, kör synkront.
+    Startar solver i bakgrunden. Returnerar job_id fÃ¶r polling.
+    Alternativt: om time_limit <= 60s, kÃ¶r synkront.
     """
     config = await db.get_config(request.clinic_id)
     if not config:
@@ -488,30 +517,30 @@ async def generate_schedule(request: ScheduleRequest, background_tasks: Backgrou
     await db.save_job(job_data)
 
     if request.time_limit_seconds <= 60:
-        # Synkron körning för snabba jobb
+        # Synkron kÃ¶rning fÃ¶r snabba jobb
         _run_solver(job_id, config, request)
         job = job_store[job_id]
 
         if job["status"] == "completed":
             return job["result"]
         elif job["status"] == "infeasible":
-            raise HTTPException(status_code=422, detail="Ingen giltig lösning kunde hittas med givna constraints")
+            raise HTTPException(status_code=422, detail="Ingen giltig lÃ¶sning kunde hittas med givna constraints")
         else:
-            raise HTTPException(status_code=500, detail=job.get("error", "Okänt fel"))
+            raise HTTPException(status_code=500, detail=job.get("error", "OkÃ¤nt fel"))
     else:
-        # Asynkron körning
+        # Asynkron kÃ¶rning
         background_tasks.add_task(_run_solver, job_id, config, request)
         return {
             "job_id": job_id,
             "schedule_id": schedule_id,
             "status": "queued",
-            "message": "Schemagenerering startad. Polla /job/{job_id} för status.",
+            "message": "Schemagenerering startad. Polla /job/{job_id} fÃ¶r status.",
         }
 
 
 @app.get("/job/{job_id}", tags=["Schema"])
 async def get_job_status(job_id: str):
-    """Hämta status för ett bakgrundsjobb."""
+    """HÃ¤mta status fÃ¶r ett bakgrundsjobb."""
     job = await db.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Jobb inte hittat")
@@ -520,7 +549,7 @@ async def get_job_status(job_id: str):
 
 @app.get("/schedule/{schedule_id}", tags=["Schema"])
 async def get_schedule(schedule_id: str):
-    """Hämta ett genererat schema."""
+    """HÃ¤mta ett genererat schema."""
     sched = await db.get_schedule(schedule_id)
     if not sched:
         raise HTTPException(status_code=404, detail="Schema inte hittat")
@@ -532,14 +561,14 @@ async def get_schedule(schedule_id: str):
 
 @app.get("/schedule/{schedule_id}/doctor/{doctor_id}", tags=["Schema"])
 async def get_doctor_schedule(schedule_id: str, doctor_id: str):
-    """Hämta schema för en specifik läkare."""
+    """HÃ¤mta schema fÃ¶r en specifik lÃ¤kare."""
     sched = await db.get_schedule(schedule_id)
     if not sched:
         raise HTTPException(status_code=404, detail="Schema inte hittat")
 
     doctor_schedule = sched["schedule"].get(doctor_id)
     if not doctor_schedule:
-        raise HTTPException(status_code=404, detail=f"Läkare '{doctor_id}' inte hittad i schema")
+        raise HTTPException(status_code=404, detail=f"LÃ¤kare '{doctor_id}' inte hittad i schema")
 
     config = await db.get_config(sched["clinic_id"])
     doc = next((d for d in config.doctors if d.id == doctor_id), None) if config else None
@@ -562,10 +591,10 @@ async def adjust_schedule(request: AdjustmentRequest):
     Manuell justering av befintligt schema.
 
     Typer:
-    - swap: Byt funktion mellan två läkare på en dag
-    - replace: Ändra en läkares funktion en specifik dag
-    - lock: Lås en tilldelning (kan inte ändras av omoptimering)
-    - unlock: Lås upp en tilldelning
+    - swap: Byt funktion mellan tvÃ¥ lÃ¤kare pÃ¥ en dag
+    - replace: Ãndra en lÃ¤kares funktion en specifik dag
+    - lock: LÃ¥s en tilldelning (kan inte Ã¤ndras av omoptimering)
+    - unlock: LÃ¥s upp en tilldelning
     """
     sched = await db.get_schedule(request.schedule_id)
     if not sched:
@@ -610,7 +639,7 @@ async def adjust_schedule(request: AdjustmentRequest):
 
     if request.adjustment_type == "swap":
         if not request.swap_with_doctor_id:
-            raise HTTPException(status_code=400, detail="swap_with_doctor_id krävs för swap")
+            raise HTTPException(status_code=400, detail="swap_with_doctor_id krÃ¤vs fÃ¶r swap")
 
         func_a = _raw_get(request.doctor_id, day_int)
         func_b = _raw_get(request.swap_with_doctor_id, day_int)
@@ -627,13 +656,13 @@ async def adjust_schedule(request: AdjustmentRequest):
 
         return {
             "status": "adjusted",
-            "adjustment": f"Bytte {request.doctor_id} ({func_a}→{func_b}) med {request.swap_with_doctor_id} ({func_b}→{func_a}) dag {request.day}",
+            "adjustment": f"Bytte {request.doctor_id} ({func_a}â{func_b}) med {request.swap_with_doctor_id} ({func_b}â{func_a}) dag {request.day}",
             "warnings": warnings,
         }
 
     elif request.adjustment_type == "replace":
         if not request.new_function:
-            raise HTTPException(status_code=400, detail="new_function krävs för replace")
+            raise HTTPException(status_code=400, detail="new_function krÃ¤vs fÃ¶r replace")
 
         old_func = _raw_get(request.doctor_id, day_int)
         _raw_set(request.doctor_id, day_int, request.new_function)
@@ -644,12 +673,12 @@ async def adjust_schedule(request: AdjustmentRequest):
 
         return {
             "status": "adjusted",
-            "adjustment": f"{request.doctor_id}: {old_func} → {request.new_function} dag {request.day}",
+            "adjustment": f"{request.doctor_id}: {old_func} â {request.new_function} dag {request.day}",
             "warnings": warnings,
         }
 
     else:
-        raise HTTPException(status_code=400, detail=f"Okänd adjustment_type: {request.adjustment_type}")
+        raise HTTPException(status_code=400, detail=f"OkÃ¤nd adjustment_type: {request.adjustment_type}")
 
 
 def _validate_single_day(schedule: dict, config: ClinicConfig, day: int) -> list[str]:
@@ -668,11 +697,11 @@ def _validate_single_day(schedule: dict, config: ClinicConfig, day: int) -> list
     backup = [d_id for d_id, days in schedule.items() if _get(days, day) == "JOUR_B"]
 
     if len(primary) != 1:
-        warnings.append(f"Dag {day}: {len(primary)} primärjourer (ska vara 1)")
+        warnings.append(f"Dag {day}: {len(primary)} primÃ¤rjourer (ska vara 1)")
     if len(backup) != 1:
         warnings.append(f"Dag {day}: {len(backup)} bakjourer (ska vara 1)")
 
-    # Kolla ATL (jour igår → arbete idag)
+    # Kolla ATL (jour igÃ¥r â arbete idag)
     if day > 0:
         for d_id, days in schedule.items():
             yesterday = _get(days, day - 1) or "LEDIG"
@@ -685,27 +714,27 @@ def _validate_single_day(schedule: dict, config: ClinicConfig, day: int) -> list
     return warnings
 
 
-# === FRÅNVARO ===
+# === FRÃNVARO ===
 
-@app.post("/absence", tags=["Frånvaro"])
+@app.post("/absence", tags=["FrÃ¥nvaro"])
 async def register_absence(request: AbsenceRequest, background_tasks: BackgroundTasks):
     """
-    Registrera frånvaro och (valfritt) omoptimera berörda scheman.
+    Registrera frÃ¥nvaro och (valfritt) omoptimera berÃ¶rda scheman.
 
-    Flöde:
-    1. Registrera frånvaron
-    2. Hitta berörda scheman
-    3. Lås alla andra tilldelningar
-    4. Omoptimera med frånvarande läkare exkluderad
+    FlÃ¶de:
+    1. Registrera frÃ¥nvaron
+    2. Hitta berÃ¶rda scheman
+    3. LÃ¥s alla andra tilldelningar
+    4. Omoptimera med frÃ¥nvarande lÃ¤kare exkluderad
     """
     config = await db.get_config(request.clinic_id)
     if not config:
         raise HTTPException(status_code=404, detail=f"Klinik '{request.clinic_id}' finns inte")
 
-    # Validera att läkaren finns
+    # Validera att lÃ¤karen finns
     doc = next((d for d in config.doctors if d.id == request.doctor_id), None)
     if not doc:
-        raise HTTPException(status_code=404, detail=f"Läkare '{request.doctor_id}' finns inte")
+        raise HTTPException(status_code=404, detail=f"LÃ¤kare '{request.doctor_id}' finns inte")
 
     absence_id = f"abs_{uuid.uuid4().hex[:8]}"
 
@@ -720,10 +749,10 @@ async def register_absence(request: AbsenceRequest, background_tasks: Background
         "affected_schedules": [],
     }
 
-    # Hitta berörda scheman
+    # Hitta berÃ¶rda scheman
     for sched_id, sched in schedule_store.items():
         if sched["clinic_id"] == request.clinic_id:
-            # Kolla om frånvaron överlappar med schemat
+            # Kolla om frÃ¥nvaron Ã¶verlappar med schemat
             sched_start = date.fromisoformat(sched["start_date"])
             sched_end = sched_start + timedelta(weeks=sched["num_weeks"])
             abs_start = date.fromisoformat(request.start_date)
@@ -732,7 +761,7 @@ async def register_absence(request: AbsenceRequest, background_tasks: Background
             if abs_start <= sched_end and abs_end >= sched_start:
                 result["affected_schedules"].append(sched_id)
 
-                # Markera frånvarande dagar som LEDIG i raw_schedule
+                # Markera frÃ¥nvarande dagar som LEDIG i raw_schedule
                 raw = sched.get("raw_schedule", {})
                 if request.doctor_id in raw:
                     for day_idx in range(sched["num_weeks"] * 7):
@@ -741,15 +770,15 @@ async def register_absence(request: AbsenceRequest, background_tasks: Background
                             old_func = raw[request.doctor_id].get(day_idx, "LEDIG")
                             raw[request.doctor_id][day_idx] = "LEDIG"
 
-                            # Uppdatera även datum-schemat
+                            # Uppdatera Ã¤ven datum-schemat
                             if request.doctor_id in sched.get("schedule", {}):
                                 sched["schedule"][request.doctor_id][day_date.isoformat()] = "LEDIG"
 
     if request.reoptimize and result["affected_schedules"]:
         result["status"] = "registered_reoptimize_pending"
-        result["message"] = f"Frånvaro registrerad. {len(result['affected_schedules'])} schema(n) behöver omoptimeras."
+        result["message"] = f"FrÃ¥nvaro registrerad. {len(result['affected_schedules'])} schema(n) behÃ¶ver omoptimeras."
     else:
-        result["message"] = "Frånvaro registrerad. Berörda dagar satta till LEDIG."
+        result["message"] = "FrÃ¥nvaro registrerad. BerÃ¶rda dagar satta till LEDIG."
 
     return result
 
@@ -759,9 +788,9 @@ async def register_absence(request: AbsenceRequest, background_tasks: Background
 @app.post("/schedule/reoptimize", tags=["Schema"])
 async def reoptimize_schedule(request: ReoptimizeRequest):
     """
-    Omoptimera ett befintligt schema efter ändringar.
+    Omoptimera ett befintligt schema efter Ã¤ndringar.
 
-    Behåller låsta tilldelningar och optimerar resten.
+    BehÃ¥ller lÃ¥sta tilldelningar och optimerar resten.
     """
     sched = await db.get_schedule(request.schedule_id)
     if not sched:
@@ -771,7 +800,7 @@ async def reoptimize_schedule(request: ReoptimizeRequest):
     if not config:
         raise HTTPException(status_code=404, detail="Klinikkonfiguration saknas")
 
-    # Kör ny optimering
+    # KÃ¶r ny optimering
     gen_request = ScheduleRequest(
         clinic_id=sched["clinic_id"],
         num_weeks=sched["num_weeks"],
@@ -802,7 +831,7 @@ async def reoptimize_schedule(request: ReoptimizeRequest):
     else:
         raise HTTPException(
             status_code=422,
-            detail=f"Omoptimering misslyckades: {job.get('error', 'okänt fel')}"
+            detail=f"Omoptimering misslyckades: {job.get('error', 'okÃ¤nt fel')}"
         )
 
 
@@ -811,13 +840,13 @@ async def reoptimize_schedule(request: ReoptimizeRequest):
 @app.post("/validate/{schedule_id}", tags=["Validering"])
 async def validate_schedule(schedule_id: str):
     """
-    Fullständig ATL-validering av ett schema.
+    FullstÃ¤ndig ATL-validering av ett schema.
 
     Kontrollerar:
     - 11h dygnsvila efter jour
-    - 36h sammanhängande veckovila
+    - 36h sammanhÃ¤ngande veckovila
     - Max 48h/vecka
-    - Max 20h sammanhängande arbete+jour
+    - Max 20h sammanhÃ¤ngande arbete+jour
     - Max 1 jour/vecka
     - Minimibemanningstal
     """
@@ -844,8 +873,8 @@ async def validate_schedule(schedule_id: str):
                     "doctor_id": doc.id,
                     "doctor_name": doc.name,
                     "day": day,
-                    "detail": f"Jour dag {day+1} → arbete dag {day+2} (kräver 11h vila)",
-                    "atl_reference": "ATL 13§, AB 13§7",
+                    "detail": f"Jour dag {day+1} â arbete dag {day+2} (krÃ¤ver 11h vila)",
+                    "atl_reference": "ATL 13Â§, AB 13Â§7",
                 })
 
     # 2. Max jourer per vecka
@@ -878,7 +907,7 @@ async def validate_schedule(schedule_id: str):
                 "type": "bemanning",
                 "severity": "critical",
                 "day": day,
-                "detail": f"Dag {day+1}: {primary} primärjourer (ska vara 1)",
+                "detail": f"Dag {day+1}: {primary} primÃ¤rjourer (ska vara 1)",
             })
         if backup != 1:
             violations.append({
@@ -947,7 +976,7 @@ async def export_schedule_excel(schedule_id: str):
     total_days = sched["num_weeks"] * 7
     dates = [start + timedelta(days=i) for i in range(total_days)]
 
-    day_names = ["Mån", "Tis", "Ons", "Tor", "Fre", "Lör", "Sön"]
+    day_names = ["MÃ¥n", "Tis", "Ons", "Tor", "Fre", "LÃ¶r", "SÃ¶n"]
 
     # Color map for functions
     func_fills = {
@@ -970,7 +999,7 @@ async def export_schedule_excel(schedule_id: str):
     )
 
     # Header row 1: day names
-    ws.cell(row=1, column=1, value="Läkare").font = Font(bold=True, size=10)
+    ws.cell(row=1, column=1, value="LÃ¤kare").font = Font(bold=True, size=10)
     ws.cell(row=1, column=2, value="Roll").font = Font(bold=True, size=10)
     for ci, d in enumerate(dates):
         cell = ws.cell(row=1, column=ci + 3, value=day_names[d.weekday()])
@@ -993,7 +1022,7 @@ async def export_schedule_excel(schedule_id: str):
             doc_map[d.id] = d
 
     # Sort doctors by role
-    role_order = {"ÖL": 0, "SP": 1, "ST_SEN": 2, "ST_TIDIG": 3, "UL": 4}
+    role_order = {"ÃL": 0, "SP": 1, "ST_SEN": 2, "ST_TIDIG": 3, "UL": 4}
     schedule_data = sched.get("schedule", {})
     def _role_str(doc):
         if doc is None:
@@ -1054,7 +1083,7 @@ async def export_schedule_excel(schedule_id: str):
 
 @app.get("/statistics/{schedule_id}", tags=["Statistik"])
 async def get_statistics(schedule_id: str):
-    """Hämta detaljerad statistik för ett schema."""
+    """HÃ¤mta detaljerad statistik fÃ¶r ett schema."""
     sched = await db.get_schedule(schedule_id)
     if not sched:
         raise HTTPException(status_code=404, detail="Schema inte hittat")
@@ -1081,40 +1110,40 @@ async def list_schedules(clinic_id: Optional[str] = None):
     ]
 
 
-# === FRÅNVAROKEDJA (Automatisk ersättare) ===
+# === FRÃNVAROKEDJA (Automatisk ersÃ¤ttare) ===
 
 class AbsenceChainRequest(BaseModel):
-    """Begäran om att köra frånvarokedjan."""
+    """BegÃ¤ran om att kÃ¶ra frÃ¥nvarokedjan."""
     schedule_id: str
     doctor_id: str
     absence_type: str = Field(description="sjuk, vab, semester, utbildning, konferens, permission, akut")
     start_date: str = Field(description="YYYY-MM-DD")
     end_date: str = Field(description="YYYY-MM-DD")
-    auto_select: bool = Field(default=True, description="Välj bästa ersättare automatiskt?")
+    auto_select: bool = Field(default=True, description="VÃ¤lj bÃ¤sta ersÃ¤ttare automatiskt?")
     reason: Optional[str] = None
 
 
 class ManualReplacementRequest(BaseModel):
-    """Manuellt val av ersättare från kandidatlistan."""
+    """Manuellt val av ersÃ¤ttare frÃ¥n kandidatlistan."""
     schedule_id: str
     day: int
     function: str
     absent_doctor_id: str
     replacement_doctor_id: str
-    override_atl: bool = Field(default=False, description="Godkänn trots ATL-varning?")
+    override_atl: bool = Field(default=False, description="GodkÃ¤nn trots ATL-varning?")
 
 
-# Absence chain store — backed by db layer
+# Absence chain store â backed by db layer
 absence_chain_store = db._chains  # backward compat dict reference
 
 
-@app.post("/absence/chain", tags=["Frånvarokedja"])
+@app.post("/absence/chain", tags=["FrÃ¥nvarokedja"])
 async def run_absence_chain(request: AbsenceChainRequest):
     """
-    Kör hela frånvarokedjan: registrera → analysera → ranka → validera → ersätt → notifiera.
+    KÃ¶r hela frÃ¥nvarokedjan: registrera â analysera â ranka â validera â ersÃ¤tt â notifiera.
 
-    Returnerar komplett resultat med ersättare, kandidatlistor, ATL-validering och notifieringar.
-    Om auto_select=False returneras bara kandidatlistan utan att schemat ändras.
+    Returnerar komplett resultat med ersÃ¤ttare, kandidatlistor, ATL-validering och notifieringar.
+    Om auto_select=False returneras bara kandidatlistan utan att schemat Ã¤ndras.
     """
     sched = await db.get_schedule(request.schedule_id)
     if not sched:
@@ -1139,7 +1168,7 @@ async def run_absence_chain(request: AbsenceChainRequest):
     # Spara resultat
     absence_chain_store[result.chain_id] = result
 
-    # WebSocket broadcast: frånvarokedja
+    # WebSocket broadcast: frÃ¥nvarokedja
     if HAS_WS:
         import asyncio
         try:
@@ -1158,14 +1187,14 @@ async def run_absence_chain(request: AbsenceChainRequest):
         except Exception:
             pass
 
-    # Om auto_select: uppdatera även datum-schemat
+    # Om auto_select: uppdatera Ã¤ven datum-schemat
     if request.auto_select and result.schedule_changes:
         for change in result.schedule_changes:
             day_date = change["date"]
-            # Frånvarande → LEDIG
+            # FrÃ¥nvarande â LEDIG
             if request.doctor_id in sched.get("schedule", {}):
                 sched["schedule"][request.doctor_id][day_date] = "LEDIG"
-            # Ersättare → ny funktion
+            # ErsÃ¤ttare â ny funktion
             repl_id = change["replacement_doctor"]
             if repl_id in sched.get("schedule", {}):
                 sched["schedule"][repl_id][day_date] = change["function"]
@@ -1178,7 +1207,7 @@ async def run_absence_chain(request: AbsenceChainRequest):
         "status": result.status.value,
         "doctor": f"{result.doctor_name} ({result.doctor_id})",
         "absence_type": result.absence_type,
-        "period": f"{result.start_date} → {result.end_date}",
+        "period": f"{result.start_date} â {result.end_date}",
         "summary": {
             "vacant_slots": len(result.vacant_slots),
             "replaced": len(result.schedule_changes),
@@ -1193,19 +1222,19 @@ async def run_absence_chain(request: AbsenceChainRequest):
     }
 
 
-@app.get("/absence/chain/{chain_id}", tags=["Frånvarokedja"])
+@app.get("/absence/chain/{chain_id}", tags=["FrÃ¥nvarokedja"])
 async def get_absence_chain(chain_id: str):
-    """Hämta resultat av en tidigare körd frånvarokedja."""
+    """HÃ¤mta resultat av en tidigare kÃ¶rd frÃ¥nvarokedja."""
     result = absence_chain_store.get(chain_id)
     if not result:
-        raise HTTPException(status_code=404, detail="Frånvarokedja inte hittad")
+        raise HTTPException(status_code=404, detail="FrÃ¥nvarokedja inte hittad")
 
     return {
         "chain_id": result.chain_id,
         "status": result.status.value,
         "doctor": f"{result.doctor_name} ({result.doctor_id})",
         "absence_type": result.absence_type,
-        "period": f"{result.start_date} → {result.end_date}",
+        "period": f"{result.start_date} â {result.end_date}",
         "replacements": result.replacements,
         "failed_slots": result.failed_slots,
         "schedule_changes": result.schedule_changes,
@@ -1214,11 +1243,11 @@ async def get_absence_chain(chain_id: str):
     }
 
 
-@app.post("/absence/chain/manual-replace", tags=["Frånvarokedja"])
+@app.post("/absence/chain/manual-replace", tags=["FrÃ¥nvarokedja"])
 async def manual_replacement(request: ManualReplacementRequest):
     """
-    Manuellt val av ersättare — för slots som kräver manuell hantering
-    eller när du vill välja en annan kandidat än den automatiskt valda.
+    Manuellt val av ersÃ¤ttare â fÃ¶r slots som krÃ¤ver manuell hantering
+    eller nÃ¤r du vill vÃ¤lja en annan kandidat Ã¤n den automatiskt valda.
     """
     sched = await db.get_schedule(request.schedule_id)
     if not sched:
@@ -1227,10 +1256,10 @@ async def manual_replacement(request: ManualReplacementRequest):
     config = await db.get_config(sched["clinic_id"])
     raw = sched.get("raw_schedule", {})
 
-    # Validera att ersättaren finns
+    # Validera att ersÃ¤ttaren finns
     doc = next((d for d in config.doctors if d.id == request.replacement_doctor_id), None)
     if not doc:
-        raise HTTPException(status_code=404, detail=f"Läkare '{request.replacement_doctor_id}' finns inte")
+        raise HTTPException(status_code=404, detail=f"LÃ¤kare '{request.replacement_doctor_id}' finns inte")
 
     # ATL-validering
     start = date.fromisoformat(sched["start_date"])
@@ -1255,17 +1284,17 @@ async def manual_replacement(request: ManualReplacementRequest):
     if not atl_result["ok"] and not request.override_atl:
         return {
             "status": "atl_violation",
-            "message": "ATL-brott upptäckt. Sätt override_atl=true för att godkänna ändå.",
+            "message": "ATL-brott upptÃ¤ckt. SÃ¤tt override_atl=true fÃ¶r att godkÃ¤nna Ã¤ndÃ¥.",
             "violations": atl_result["violations"],
         }
 
-    # Verkställ
+    # VerkstÃ¤ll
     old_func = raw.get(request.replacement_doctor_id, {}).get(request.day, "LEDIG")
 
-    # Frånvarande → LEDIG
+    # FrÃ¥nvarande â LEDIG
     if request.absent_doctor_id in raw:
         raw[request.absent_doctor_id][request.day] = "LEDIG"
-    # Ersättare → funktion
+    # ErsÃ¤ttare â funktion
     if request.replacement_doctor_id in raw:
         raw[request.replacement_doctor_id][request.day] = request.function
 
@@ -1290,9 +1319,9 @@ async def manual_replacement(request: ManualReplacementRequest):
     }
 
 
-@app.get("/absence/chains", tags=["Frånvarokedja"])
+@app.get("/absence/chains", tags=["FrÃ¥nvarokedja"])
 async def list_absence_chains(status: Optional[str] = None):
-    """Lista alla körda frånvarokedjor."""
+    """Lista alla kÃ¶rda frÃ¥nvarokedjor."""
     results = []
     for chain_id, result in absence_chain_store.items():
         if status and result.status.value != status:
@@ -1301,7 +1330,7 @@ async def list_absence_chains(status: Optional[str] = None):
             "chain_id": result.chain_id,
             "doctor": f"{result.doctor_name} ({result.doctor_id})",
             "absence_type": result.absence_type,
-            "period": f"{result.start_date} → {result.end_date}",
+            "period": f"{result.start_date} â {result.end_date}",
             "status": result.status.value,
             "replaced": len(result.schedule_changes),
             "failed": len(result.failed_slots),
@@ -1321,3 +1350,4 @@ async def db_status():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+
