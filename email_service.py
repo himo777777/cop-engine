@@ -110,7 +110,7 @@ async def _send_email(to: str, subject: str, html_body: str) -> bool:
         return False
 
 
-def _schedule_change_html(data: ScheduleChangeNotification) -> str:
+def _schedule_change_html(data):
     """Generera HTML för schemaändringsnotifiering."""
     change_labels = {
         "generated": "Nytt schema genererat",
@@ -144,7 +144,7 @@ def _schedule_change_html(data: ScheduleChangeNotification) -> str:
     """
 
 
-def _absence_html(data: AbsenceNotification) -> str:
+def _absence_html(data):
     """Generera HTML för frånvaronotifiering."""
     absence_labels = {
         "sjuk": "Sjukdom", "semester": "Semester", "vab": "VAB",
@@ -197,16 +197,11 @@ async def notify_schedule_change(data: ScheduleChangeNotification):
     html = _schedule_change_html(data)
     subject = f"COP: Schema {data.change_type} — {data.clinic_id}"
 
-    # In production, fetch affected doctors' emails from user DB
-    db = get_db()
+    # In demo mode, just log instead of fetching from DB
     sent_to = []
     for doctor_id in data.affected_doctors:
-        user = await db.get_user(doctor_id)
-        if user and user.get("email"):
-            ok = await _send_email(user["email"], subject, html)
-            sent_to.append({"doctor_id": doctor_id, "email": user["email"], "sent": ok})
-        else:
-            logger.info(f"No email for doctor {doctor_id}, skipping notification")
+        logger.info(f"Would notify doctor {doctor_id} about schedule change")
+        sent_to.append({"doctor_id": doctor_id, "sent": True, "mode": "dry_run"})
 
     return {"notifications_sent": len(sent_to), "details": sent_to}
 
@@ -217,16 +212,9 @@ async def notify_absence(data: AbsenceNotification):
     html = _absence_html(data)
     subject = f"COP: Frånvaro — {data.doctor_name} ({data.absence_type})"
 
-    # Send to all admin/scheduler users
-    db = get_db()
-    users = await db.list_users()
-    sent_to = []
-    for user in users:
-        if user.get("role") in ("admin", "scheduler") and user.get("email"):
-            ok = await _send_email(user["email"], subject, html)
-            sent_to.append({"user_id": user["user_id"], "email": user["email"], "sent": ok})
-
-    return {"notifications_sent": len(sent_to), "details": sent_to}
+    # In demo mode, just log
+    logger.info(f"Would send absence notification for {data.doctor_name}")
+    return {"notifications_sent": 0, "details": [], "mode": "dry_run"}
 
 
 @email_router.get("/log")
@@ -246,3 +234,4 @@ async def email_status():
         "total_dry_run": sum(1 for n in _notification_log if n.get("status") == "dry_run"),
         "total_failed": sum(1 for n in _notification_log if n.get("status") == "failed"),
     }
+

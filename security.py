@@ -61,3 +61,4 @@ def setup_security(app: FastAPI):
     limiter = setup_rate_limiting(app)
     logger.info("Security middleware configured")
     return limiter
+
