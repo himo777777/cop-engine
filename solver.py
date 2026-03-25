@@ -361,16 +361,85 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
                             model.add_bool_or([x[(doc.id, day, op_fid)].negated(), x[(want_with, day, op_fid)].negated()]).only_enforce_if(both_var.negated())
                             preference_bonus.append(2 * both_var)
 
+    # === MJUK: 36h veckovila — penalty om inte 2 sammanhängande lediga dagar per vecka ===
+    weekly_rest_violations = []
+    for doc in config.doctors:
+        for week in range(num_weeks):
+            ws = week * 7
+            # has_consecutive_rest = 1 om minst 2 dagar i rad är LEDIG
+            has_rest = model.new_bool_var(f"wrest_{doc.id}_{week}")
+            # Check all consecutive day pairs in the week
+            pair_vars = []
+            for d in range(ws, min(ws + 6, num_days - 1)):
+                pair = model.new_bool_var(f"rpair_{doc.id}_{d}")
+                model.add_bool_and([
+                    x[(doc.id, d, "LEDIG")],
+                    x[(doc.id, d + 1, "LEDIG")]
+                ]).only_enforce_if(pair)
+                model.add_bool_or([
+                    x[(doc.id, d, "LEDIG")].negated(),
+                    x[(doc.id, d + 1, "LEDIG")].negated()
+                ]).only_enforce_if(pair.negated())
+                pair_vars.append(pair)
+            if pair_vars:
+                model.add_max_equality(has_rest, pair_vars)
+                weekly_rest_violations.append(has_rest)
+
+    # === MJUK: Helgfrekvens — penalty om jour oftare än var N:e helg ===
+    weekend_freq = config.call_structure.max_weekend_frequency or 4
+    weekend_penalties = []
+    for doc in config.doctors:
+        if not (doc.can_primary_call or doc.can_backup_call):
+            continue
+        for week in range(max(0, num_weeks - weekend_freq + 1)):
+            # Count weekend calls in a window of weekend_freq weeks
+            weekend_calls = []
+            for w in range(week, min(week + weekend_freq, num_weeks)):
+                sat = w * 7 + 5
+                sun = w * 7 + 6
+                for d in [sat, sun]:
+                    if d < num_days:
+                        if (doc.id, d, "JOUR_P") in x:
+                            weekend_calls.append(x[(doc.id, d, "JOUR_P")])
+                        if (doc.id, d, "JOUR_B") in x:
+                            weekend_calls.append(x[(doc.id, d, "JOUR_B")])
+            if weekend_calls:
+                too_many = model.new_bool_var(f"wknd_{doc.id}_{week}")
+                model.add(sum(weekend_calls) > 1).only_enforce_if(too_many)
+                model.add(sum(weekend_calls) <= 1).only_enforce_if(too_many.negated())
+                weekend_penalties.append(too_many)
+
+    # === MJUK: Site preference bonus ===
+    site_pref_bonus = []
+    for doc in config.doctors:
+        if not doc.site_preference:
+            continue
+        for day in range(num_days):
+            if day % 7 >= 5:
+                continue
+            for func_id, func, site in day_functions:
+                if site == doc.site_preference and (doc.id, day, func_id) in x:
+                    site_pref_bonus.append(x[(doc.id, day, func_id)])
+
     # === OBJEKTIV FUNKTION ===
     objective_terms = []
     for bonus_var in st_training_bonus:
-        objective_terms.append(10 * bonus_var)
+        objective_terms.append(15 * bonus_var)  # ST-träning (höjd från 10)
     for pref_term in preference_bonus:
         objective_terms.append(pref_term)
     if call_counts:
         call_spread = model.new_int_var(0, num_days, "call_spread")
         model.add(call_spread == max_calls - min_calls)
         objective_terms.append(-5 * call_spread)
+    # Veckovila: bonus för att ha den (+20 per vecka med vila)
+    for rest_var in weekly_rest_violations:
+        objective_terms.append(20 * rest_var)
+    # Helgfrekvens: penalty (-10 per brott)
+    for wknd_var in weekend_penalties:
+        objective_terms.append(-10 * wknd_var)
+    # Site preference: bonus (+5 per matchande dag)
+    for sp_var in site_pref_bonus:
+        objective_terms.append(5 * sp_var)
 
     if objective_terms:
         model.maximize(sum(objective_terms))

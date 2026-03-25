@@ -655,6 +655,8 @@ async def adjust_schedule(request: AdjustmentRequest):
         _raw_set(request.swap_with_doctor_id, day_int, func_a)
 
         _sync_date_schedule()
+        await db.save_schedule(sched)
+        await db.audit("schedule_swap", details={"schedule_id": request.schedule_id, "day": request.day, "doctor_a": request.doctor_id, "doctor_b": request.swap_with_doctor_id})
 
         warnings = _validate_single_day(raw, config, day_int)
 
@@ -672,6 +674,8 @@ async def adjust_schedule(request: AdjustmentRequest):
         _raw_set(request.doctor_id, day_int, request.new_function)
 
         _sync_date_schedule()
+        await db.save_schedule(sched)
+        await db.audit("schedule_replace", details={"schedule_id": request.schedule_id, "day": request.day, "doctor": request.doctor_id})
 
         warnings = _validate_single_day(raw, config, day_int)
 

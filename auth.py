@@ -519,8 +519,19 @@ async def refresh_token(refresh_token: str):
 
 
 @auth_router.post("/logout")
-async def logout(user: CurrentUser = Depends(get_current_user)):
+async def logout(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    user: CurrentUser = Depends(get_current_user),
+):
     """Logga ut (invalidera token)."""
+    if credentials:
+        token = credentials.credentials
+        _revoked_tokens.add(token)
+        try:
+            from db import get_db
+            await get_db().revoke_token(token)
+        except Exception:
+            pass
     return {"message": f"Utloggad: {user.username}"}
 
 

@@ -140,6 +140,8 @@ class AbsenceChain:
     SCORE_SUPERVISOR_MATCH = 15
     PENALTY_CALL_SAME_WEEK = -50
     PENALTY_PARTTIME_FULL = -30
+    PENALTY_ALREADY_REPLACING = -40
+    MAX_CASCADE_DEPTH = 3
 
     def __init__(self, config: ClinicConfig, raw_schedule: dict,
                  schedule_start_date: date, num_weeks: int):
@@ -185,6 +187,7 @@ class AbsenceChain:
         self.chain_log: list[ChainStep] = []
         self.notifications: list[dict] = []
         self.webhook_urls: list[str] = []
+        self._replacing: set[tuple[str, int]] = set()  # (doctor_id, day_index) currently being replaced
 
     def _log(self, step: int, action: str, status: ChainStatus, details: dict = None):
         """Logga ett steg i kedjan."""
@@ -318,6 +321,9 @@ class AbsenceChain:
             if selected.doctor_id in self.schedule:
                 self.schedule[selected.doctor_id][slot.day_index] = slot.function
 
+            # Track replacement
+            self._replacing.add((selected.doctor_id, slot.day_index))
+
             change = {
                 "day": slot.day_index,
                 "date": slot.day_date.isoformat(),
@@ -328,8 +334,24 @@ class AbsenceChain:
                 "replacement_old_function": old_func,
                 "score": selected.score,
                 "atl_ok": selected.atl_ok,
+                "cascade_depth": getattr(slot, '_cascade_depth', 0),
             }
             schedule_changes.append(change)
+
+            # CASCADE: om ersättaren inte var LEDIG, skapa ny vakant slot
+            if old_func != "LEDIG" and getattr(slot, '_cascade_depth', 0) < self.MAX_CASCADE_DEPTH:
+                cascade_slot = VacantSlot(
+                    day_index=slot.day_index,
+                    day_date=slot.day_date,
+                    function=old_func,
+                    is_call=old_func in ("JOUR_P", "JOUR_B"),
+                    site=self.FUNCTION_SITE.get(old_func),
+                    weekday=slot.weekday,
+                )
+                cascade_slot._cascade_depth = getattr(slot, '_cascade_depth', 0) + 1
+                vacant_slots.append(cascade_slot)
+                self._log(5, f"Kaskad: {selected.doctor_name} lämnade {old_func} dag {slot.day_index} (nivå {cascade_slot._cascade_depth})",
+                          ChainStatus.ANALYZING)
 
             replacements.append({
                 "day": slot.day_index,
@@ -499,7 +521,12 @@ class AbsenceChain:
                 score += self.PENALTY_CALL_SAME_WEEK
                 reasons.append(f"{self.PENALTY_CALL_SAME_WEEK} redan jour denna vecka")
 
-            # 9. Straff: deltid och redan fullt
+            # 9. Straff: redan ersättare i annan kedja
+            if (doc.id, slot.day_index) in self._replacing:
+                score += self.PENALTY_ALREADY_REPLACING
+                reasons.append(f"{self.PENALTY_ALREADY_REPLACING} redan ersättare denna dag")
+
+            # 10. Straff: deltid och redan fullt
             if doc.employment_rate < 1.0:
                 expected_days = self.num_days * doc.employment_rate * (5/7)
                 if work_days >= expected_days:
