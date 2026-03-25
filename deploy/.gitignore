@@ -1,0 +1,13 @@
+# Terraform
+*.tfstate
+*.tfstate.backup
+*.tfplan
+tfplan
+.terraform/
+.terraform.lock.hcl
+terraform.tfvars
+crash.log
+
+# Secrets
+*.pem
+*.key

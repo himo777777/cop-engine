@@ -1,0 +1,28 @@
+# COP Engine — Clinical Operations Protocol
+# Python 3.10+ required
+
+# === Core Framework ===
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+
+# === Solver ===
+ortools==9.11.4210
+
+# === LLM Agent ===
+anthropic==0.42.0
+
+# === Database (Tessa MongoDB adapter) ===
+motor==3.6.0
+pymongo>=4.9,<4.10
+
+# === Export ===
+openpyxl==3.1.5
+
+# === Utilities ===
+python-dotenv==1.0.1
+python-multipart==0.0.18
+
+# === Production ===
+gunicorn==23.0.0
+httpx==0.28.1

@@ -1,0 +1,36 @@
+# ============================================================================
+# COP Engine — Terraform Variables (EXEMPEL)
+# ============================================================================
+# Kopiera till terraform.tfvars och fyll i dina värden.
+# OBS: terraform.tfvars ska ALDRIG committas till git!
+# ============================================================================
+
+# --- Projekt ---
+project     = "cop"
+environment = "prod"          # dev | staging | prod
+
+# --- AWS ---
+aws_region    = "eu-north-1"  # Stockholm
+vpc_cidr      = "10.0.0.0/16"
+allowed_cidrs = ["0.0.0.0/0"] # Begränsa vid behov
+
+# --- ECS / Fargate ---
+container_port   = 8000
+task_cpu         = "1024"     # 1 vCPU
+task_memory      = "2048"     # 2 GB RAM
+gunicorn_workers = 2
+min_tasks        = 2          # Minimum replicas
+max_tasks        = 6          # Max replicas (auto-scaling)
+image_tag        = "latest"
+
+# --- DocumentDB ---
+docdb_username       = "copadmin"
+docdb_password       = "ÄNDRA-TILL-STARKT-LÖSENORD"
+docdb_instance_class = "db.t3.medium"
+docdb_instance_count = 2
+
+# --- Secrets ---
+anthropic_api_key = "sk-ant-..."
+
+# --- SSL ---
+acm_certificate_arn = "arn:aws:acm:eu-north-1:123456789:certificate/abc-def-ghi"

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
+pytest-cache-files-*
+*.egg-info/
+dist/
+build/
+.vercel/
+node_modules/
+validation_results_*.json

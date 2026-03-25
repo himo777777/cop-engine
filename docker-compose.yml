@@ -1,0 +1,122 @@
+# ============================================================
+# COP Engine — Docker Compose Production Stack
+# ============================================================
+# Tjänster:
+#   1. cop-api      — FastAPI + OR-Tools solver + LLM agent
+#   2. cop-mongo    — MongoDB (för Tessa-data / lokal dev)
+#   3. cop-nginx    — Reverse proxy med SSL-stöd
+#
+# Starta:
+#   docker compose up -d
+#
+# Starta utan Tessa/MongoDB:
+#   docker compose up -d cop-api cop-nginx
+# ============================================================
+
+version: "3.9"
+
+services:
+
+  # === COP API (FastAPI + Solver + Agent) ===
+  cop-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cop-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - COP_ENV=production
+      - COP_HOST=0.0.0.0
+      - COP_PORT=8000
+      - COP_WORKERS=${COP_WORKERS:-2}
+      - COP_LOG_LEVEL=${COP_LOG_LEVEL:-info}
+      # COP MongoDB (persistent lagring)
+      - COP_MONGO_URI=mongodb://cop-mongo:27017
+      - COP_MONGO_DB=${COP_MONGO_DB:-cop}
+      # Tessa/MongoDB
+      - TESSA_HOST=cop-mongo
+      - TESSA_PORT=27017
+      - TESSA_DATABASE=${TESSA_DATABASE:-meteor}
+      - TESSA_DEPARTMENT=${TESSA_DEPARTMENT:-Ortopedi}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - COP_SOLVER_TIME_LIMIT=${COP_SOLVER_TIME_LIMIT:-30}
+      - COP_SCHEDULE_WEEKS=${COP_SCHEDULE_WEEKS:-2}
+    ports:
+      - "${COP_API_PORT:-8000}:8000"
+    volumes:
+      - cop-data:/app/data
+      - cop-logs:/app/logs
+      - cop-exports:/app/exports
+    depends_on:
+      cop-mongo:
+        condition: service_healthy
+    networks:
+      - cop-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # === MongoDB (COP-persistens + Tessa-kompatibel) ===
+  cop-mongo:
+    image: mongo:7.0
+    container_name: cop-mongo
+    restart: unless-stopped
+    environment:
+      - MONGO_INITDB_DATABASE=${COP_MONGO_DB:-cop}
+    ports:
+      - "${MONGO_PORT:-27017}:27017"
+    volumes:
+      - mongo-data:/data/db
+      - ./mongo-init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - cop-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # Resursbegränsning
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # === Nginx Reverse Proxy ===
+  cop-nginx:
+    image: nginx:1.27-alpine
+    container_name: cop-nginx
+    restart: unless-stopped
+    ports:
+      - "${NGINX_HTTP_PORT:-80}:80"
+      - "${NGINX_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+      - cop-logs:/var/log/cop
+    depends_on:
+      cop-api:
+        condition: service_healthy
+    networks:
+      - cop-net
+
+# === Volumes ===
+volumes:
+  cop-data:
+    driver: local
+  cop-logs:
+    driver: local
+  cop-exports:
+    driver: local
+  mongo-data:
+    driver: local
+
+# === Network ===
+networks:
+  cop-net:
+    driver: bridge
+    name: cop-network

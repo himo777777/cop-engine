@@ -1,0 +1,190 @@
+# ============================================================================
+# COP Engine — GitHub Actions CI/CD Pipeline
+# ============================================================================
+# Placera i: .github/workflows/cop-deploy.yml
+#
+# Triggers:
+#   push to main     → Test + Build + Deploy to prod
+#   push to develop  → Test + Build + Deploy to staging
+#   pull_request     → Test only
+# ============================================================================
+
+name: COP Engine CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'cop-engine/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'cop-engine/**'
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REPOSITORY: cop-api
+  ECS_CLUSTER: cop-cluster
+  ECS_SERVICE: cop-api
+  CONTAINER_NAME: cop-api
+
+permissions:
+  contents: read
+  id-token: write  # For OIDC
+
+jobs:
+  # ========== TEST ==========
+  test:
+    name: "🧪 Test Suite"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        working-directory: cop-engine
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio httpx
+
+      - name: Run unit tests
+        working-directory: cop-engine
+        run: |
+          pytest tests/ -v --tb=short -p no:cacheprovider \
+            --junitxml=test-results.xml \
+            2>&1 | tee test-output.txt
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: cop-engine/test-results.xml
+
+  # ========== BUILD & PUSH ==========
+  build:
+    name: "🐳 Build & Push"
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract metadata
+        id: meta
+        run: |
+          SHA_SHORT=$(echo ${{ github.sha }} | cut -c1-7)
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            TAGS="latest,${SHA_SHORT},${TIMESTAMP}"
+            ENVIRONMENT="prod"
+          else
+            TAGS="staging,staging-${SHA_SHORT}"
+            ENVIRONMENT="staging"
+          fi
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+          echo "environment=${ENVIRONMENT}" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        working-directory: cop-engine
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          IFS=',' read -ra TAG_ARRAY <<< "${{ steps.meta.outputs.tags }}"
+          BUILD_ARGS=""
+          for tag in "${TAG_ARRAY[@]}"; do
+            BUILD_ARGS="$BUILD_ARGS -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${tag}"
+          done
+
+          docker build $BUILD_ARGS .
+
+          for tag in "${TAG_ARRAY[@]}"; do
+            docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:${tag}"
+          done
+
+          echo "✅ Pushed: ${ECR_REGISTRY}/${ECR_REPOSITORY}"
+
+  # ========== DEPLOY ==========
+  deploy:
+    name: "🚀 Deploy to ${{ needs.build.outputs.image_tag && 'prod' || 'staging' }}"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: ${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}
+      url: ${{ steps.deploy.outputs.url }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to ECS
+        id: deploy
+        run: |
+          echo "🚀 Deploying to ECS..."
+
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+          echo "⏳ Waiting for deployment to stabilize..."
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --region ${{ env.AWS_REGION }}
+
+          # Hämta ALB DNS
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names cop-alb \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text 2>/dev/null || echo "pending")
+
+          echo "url=https://${ALB_DNS}" >> $GITHUB_OUTPUT
+          echo "✅ Deployment complete: https://${ALB_DNS}"
+
+      - name: Verify health check
+        run: |
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names cop-alb \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$ALB_DNS" ]; then
+            for i in {1..5}; do
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://${ALB_DNS}/health" 2>/dev/null || echo "000")
+              if [ "$STATUS" = "200" ]; then
+                echo "✅ Health check passed"
+                exit 0
+              fi
+              echo "⏳ Attempt $i/5 — HTTP $STATUS"
+              sleep 10
+            done
+            echo "⚠️ Health check did not pass within 50s"
+          fi

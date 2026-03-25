@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+venv/
+.venv/
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Config
+.env
+.env.local
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Data (mount as volumes instead)
+data/
+logs/
+exports/
+mongo-init/
+
+# Docs
+*.md
+*.docx
+LICENSE
+
+# SSL certs (mount separately)
+ssl/
+
+# Git
+.git
+.gitignore
