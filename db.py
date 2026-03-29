@@ -128,6 +128,24 @@ CREATE INDEX IF NOT EXISTS idx_ai_rules_clinic ON ai_rules(clinic_id);
 CREATE INDEX IF NOT EXISTS idx_ai_chat_clinic ON ai_chat_history(clinic_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_ai_pred_clinic ON ai_predictions(clinic_id);
 
+-- Migration: email i users (saknades i äldre schema)
+DO $$ BEGIN
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+-- Migration: full_name i users
+DO $$ BEGIN
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+-- Migration: doctor_id i users
+DO $$ BEGIN
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS doctor_id TEXT;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
 -- Migration: password_change_required i users
 DO $$ BEGIN
   ALTER TABLE users ADD COLUMN IF NOT EXISTS password_change_required BOOLEAN DEFAULT FALSE;
