@@ -1165,13 +1165,19 @@ async def validate_schedule(schedule_id: str):
         raise HTTPException(status_code=404, detail="Schema inte hittat")
 
     config = await db.get_config(sched["clinic_id"])
-    raw = sched.get("raw_schedule", {})
+    raw_db = sched.get("raw_schedule") or {}
 
-    # Konvertera schedule (datumsnycklar) → raw_schedule (int-index) om det saknas
-    if not raw and sched.get("schedule"):
-        _start = date.fromisoformat(sched["start_date"])
-        _num = sched["num_weeks"] * 7
-        raw = {}
+    # JSON sparar int-nycklar som strängar: konvertera tillbaka till int, eller
+    # bygg raw från schedule (datumsnycklar) om raw saknas/tomt.
+    _start = date.fromisoformat(sched["start_date"])
+    _num = sched["num_weeks"] * 7
+    raw = {}
+    if raw_db:
+        # Konvertera JSON-strängnycklar ("0","1",...) → int
+        for _doc_id, _days in raw_db.items():
+            raw[_doc_id] = {int(k): v for k, v in _days.items()}
+    elif sched.get("schedule"):
+        # Fallback: bygg från datumsnycklar
         for _doc_id, _days in sched["schedule"].items():
             raw[_doc_id] = {}
             for _date_str, _shift in _days.items():
@@ -1183,7 +1189,7 @@ async def validate_schedule(schedule_id: str):
                 except (ValueError, TypeError):
                     pass
 
-    num_days = sched["num_weeks"] * 7
+    num_days = _num
 
     violations = []
     warnings = []
@@ -1486,21 +1492,23 @@ async def run_absence_chain(request: AbsenceChainRequest):
     if not config:
         raise HTTPException(status_code=404, detail="Klinikkonfiguration saknas")
 
-    raw = sched.get("raw_schedule", {})
+    raw_db = sched.get("raw_schedule") or {}
     start = date.fromisoformat(sched["start_date"])
+    _chain_num_days = sched["num_weeks"] * 7
 
-    # Om raw_schedule saknas (äldre schema-format), konvertera från schedule (datumsnycklar → int-index)
-    if not raw and sched.get("schedule"):
-        sched_data = sched["schedule"]
-        num_days = sched["num_weeks"] * 7
-        raw = {}
-        for doc_id, days in sched_data.items():
+    # JSON konverterar int-nycklar till strängar — konvertera tillbaka, eller bygg från schedule
+    raw = {}
+    if raw_db:
+        for doc_id, days in raw_db.items():
+            raw[doc_id] = {int(k): v for k, v in days.items()}
+    elif sched.get("schedule"):
+        for doc_id, days in sched["schedule"].items():
             raw[doc_id] = {}
             for date_str, shift in days.items():
                 try:
                     d = date.fromisoformat(date_str)
                     day_idx = (d - start).days
-                    if 0 <= day_idx < num_days:
+                    if 0 <= day_idx < _chain_num_days:
                         raw[doc_id][day_idx] = shift
                 except (ValueError, TypeError):
                     pass
