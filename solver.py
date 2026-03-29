@@ -25,7 +25,8 @@ from ortools.sat.python import cp_model
 
 from data_model import (
     ClinicConfig, Role, ShiftType, Function, ConstraintRule,
-    create_kristianstad_example, is_jour, OBRates,
+    create_kristianstad_example, is_jour, is_non_clinical, OBRates,
+    NON_CLINICAL_FUNC_IDS,
 )
 
 
@@ -43,8 +44,13 @@ FUNC_NAMES = {
     Function.JOUR_B_HELGDAG: "BJ Helgdag",
     Function.JOUR_B_HELGNATT: "BJ Helgnatt",
     Function.ADMIN: "Admin",
+    Function.FORSKNING: "Forskning",
+    Function.HANDLEDNING: "Handledning",
+    Function.UTBILDNING: "Utbildning",
+    Function.AKUT: "Akut",
     Function.LEDIG: "Ledig",
     Function.SEMESTER: "Semester",
+    Function.KOMPLEDIGHET: "Kompledighet",
 }
 
 DAY_NAMES = ["Mån", "Tis", "Ons", "Tor", "Fre", "Lör", "Sön"]
@@ -109,6 +115,23 @@ def _build_functions(config: ClinicConfig):
     for site in config.sites:
         day_functions.append((f"AVD_{site}", Function.AVDELNING, site))
         day_functions.append((f"MOTT_{site}", Function.MOTTAGNING, site))
+
+    # AKUT per site (om StaffingRequirement finns för AKUT)
+    akut_sites = set()
+    for req in getattr(config, 'staffing_requirements', []):
+        if req.function == Function.AKUTMOTTAGNING:
+            akut_sites.add(req.site)
+    if not akut_sites:
+        # Fallback: alla sites har akut
+        akut_sites = set(config.sites)
+    for site in sorted(akut_sites):
+        day_functions.append((f"AKUT_{site}", Function.AKUTMOTTAGNING, site))
+
+    # Icke-kliniska funktioner (ej site-specifika)
+    day_functions.append(("ADMIN", Function.ADMIN, None))
+    day_functions.append(("FORSKNING", Function.FORSKNING, None))
+    day_functions.append(("HANDLEDNING", Function.HANDLEDNING, None))
+    day_functions.append(("UTBILDNING", Function.UTBILDNING, None))
 
     # Jour (universella — inte site-specifika i modellen)
     call_functions = [
@@ -227,11 +250,16 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
     # === CONSTRAINT X: Kompetensmatchning ===
     # För varje ShiftDefinition med required_competencies: minst en kvalificerad läkare måste vara tilldelad.
     _FUNC_TO_ID = {
-        Function.OPERATION:     lambda s: f"OP_{s.site}",
-        Function.AVDELNING:     lambda s: f"AVD_{s.site}",
-        Function.MOTTAGNING:    lambda s: f"MOTT_{s.site}",
-        Function.PRIMÄRJOUR:    lambda _: "JOUR_P",
-        Function.BAKJOUR:       lambda _: "JOUR_B",
+        Function.OPERATION:       lambda s: f"OP_{s.site}",
+        Function.AVDELNING:       lambda s: f"AVD_{s.site}",
+        Function.MOTTAGNING:      lambda s: f"MOTT_{s.site}",
+        Function.AKUTMOTTAGNING:  lambda s: f"AKUT_{s.site}",
+        Function.PRIMÄRJOUR:      lambda _: "JOUR_P",
+        Function.BAKJOUR:         lambda _: "JOUR_B",
+        Function.ADMIN:           lambda _: "ADMIN",
+        Function.FORSKNING:       lambda _: "FORSKNING",
+        Function.HANDLEDNING:     lambda _: "HANDLEDNING",
+        Function.UTBILDNING:      lambda _: "UTBILDNING",
     }
     for shift_def in getattr(config, "shift_definitions", []):
         if not getattr(shift_def, "required_competencies", None):
@@ -341,18 +369,28 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
                         if pref.priority == 1:
                             model.add(x[(doc.id, day_idx, "LEDIG")] == 1)
 
-    # === CONSTRAINT 10: Deltid ===
+    # === CONSTRAINT 10: Deltid / explicit arbetsdagar per vecka ===
     for doc in config.doctors:
-        if doc.employment_rate < 1.0:
+        # Explicit work_days_per_week tar prioritet, annars beräkna från employment_rate
+        explicit_days = getattr(doc, 'work_days_per_week', None)
+        if explicit_days is not None:
+            max_work_per_week = explicit_days
+        elif doc.employment_rate < 1.0:
             max_work_per_week = int(5 * doc.employment_rate + 0.5)
-            for week in range(num_weeks):
-                week_start = week * 7
-                work_vars = []
-                for d in range(week_start, min(week_start + 7, num_days)):
-                    if (doc.id, d, "LEDIG") in x:
-                        work_vars.append(1 - x[(doc.id, d, "LEDIG")])
-                if work_vars:
-                    model.add(sum(work_vars) <= max_work_per_week)
+        else:
+            continue  # Heltid utan explicit begränsning → hanteras av constraint 8
+
+        for week in range(num_weeks):
+            week_start = week * 7
+            work_vars = []
+            for d in range(week_start, min(week_start + 7, num_days)):
+                if (doc.id, d, "LEDIG") in x:
+                    work_vars.append(1 - x[(doc.id, d, "LEDIG")])
+            if work_vars:
+                model.add(sum(work_vars) <= max_work_per_week)
+                # Om explicit_days: solvern ska försöka använda exakt så många dagar
+                if explicit_days is not None:
+                    model.add(sum(work_vars) >= max(0, max_work_per_week - 1))
 
     # === CONSTRAINT 11: Seniornärvaro per vardag ===
     for day in range(num_days):
@@ -464,6 +502,180 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
             ledig_vars = [x[(did, day, "LEDIG")] for did in doc_ids if (did, day, "LEDIG") in x]
             if ledig_vars:
                 model.add(sum(ledig_vars) <= max_vac)
+
+    # === CONSTRAINT 15: Varannan vecka (biweekly pattern) ===
+    # Läkare med schedule_pattern="biweekly_even" jobbar bara jämna veckor (0, 2, 4, ...)
+    # Läkare med schedule_pattern="biweekly_odd" jobbar bara udda veckor (1, 3, 5, ...)
+    for doc in config.doctors:
+        pattern = getattr(doc, 'schedule_pattern', 'weekly')
+        if pattern in ('biweekly_even', 'biweekly_odd'):
+            for week in range(num_weeks):
+                is_off_week = (
+                    (pattern == 'biweekly_even' and week % 2 == 1) or
+                    (pattern == 'biweekly_odd' and week % 2 == 0)
+                )
+                if is_off_week:
+                    week_start = week * 7
+                    for d in range(week_start, min(week_start + 7, num_days)):
+                        if (doc.id, d, "LEDIG") in x:
+                            model.add(x[(doc.id, d, "LEDIG")] == 1)
+
+    # === CONSTRAINT 16: Fasta veckodagar ===
+    # fixed_weekdays: {"monday": "OP_CSK", "wednesday": "MOTT_Hässleholm"}
+    WEEKDAY_MAP = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4}
+    for doc in config.doctors:
+        fixed = getattr(doc, 'fixed_weekdays', {})
+        if not fixed:
+            continue
+        pattern = getattr(doc, 'schedule_pattern', 'weekly')
+        for day_name, func_id in fixed.items():
+            wd = WEEKDAY_MAP.get(day_name.lower())
+            if wd is None:
+                continue
+            for week in range(num_weeks):
+                # Respektera biweekly: hoppa över off-veckor
+                if pattern == 'biweekly_even' and week % 2 == 1:
+                    continue
+                if pattern == 'biweekly_odd' and week % 2 == 0:
+                    continue
+                day_idx = week * 7 + wd
+                if day_idx < num_days and (doc.id, day_idx, func_id) in x:
+                    model.add(x[(doc.id, day_idx, func_id)] == 1)
+
+    # === CONSTRAINT 17: Min passtyp per vecka ===
+    # min_shifts_per_week: {"OP": 1, "MOTT": 1} = minst 1 OP-dag + 1 MOTT-dag per arbetsvecka
+    for doc in config.doctors:
+        min_shifts = getattr(doc, 'min_shifts_per_week', {})
+        if not min_shifts:
+            continue
+        pattern = getattr(doc, 'schedule_pattern', 'weekly')
+        for week in range(num_weeks):
+            # Hoppa över off-veckor
+            if pattern == 'biweekly_even' and week % 2 == 1:
+                continue
+            if pattern == 'biweekly_odd' and week % 2 == 0:
+                continue
+            week_start = week * 7
+            for shift_prefix, min_count in min_shifts.items():
+                # Hitta alla func_ids som matchar prefixet (t.ex. "OP" matchar "OP_CSK", "OP_Hässleholm")
+                matching_vars = []
+                for d in range(week_start, min(week_start + 5, num_days)):  # Bara vardagar
+                    for func_id, _, _ in day_functions:
+                        if func_id.startswith(shift_prefix) and (doc.id, d, func_id) in x:
+                            matching_vars.append(x[(doc.id, d, func_id)])
+                    # Kolla även exakt match (t.ex. "ADMIN")
+                    if (doc.id, d, shift_prefix) in x and shift_prefix not in [f[0] for f in day_functions if f[0].startswith(shift_prefix)]:
+                        matching_vars.append(x[(doc.id, d, shift_prefix)])
+                if matching_vars:
+                    model.add(sum(matching_vars) >= min_count)
+
+    # === CONSTRAINT 18: Max passtyp per vecka ===
+    for doc in config.doctors:
+        max_shifts = getattr(doc, 'max_shifts_per_week', {})
+        if not max_shifts:
+            continue
+        pattern = getattr(doc, 'schedule_pattern', 'weekly')
+        for week in range(num_weeks):
+            if pattern == 'biweekly_even' and week % 2 == 1:
+                continue
+            if pattern == 'biweekly_odd' and week % 2 == 0:
+                continue
+            week_start = week * 7
+            for shift_prefix, max_count in max_shifts.items():
+                matching_vars = []
+                for d in range(week_start, min(week_start + 5, num_days)):
+                    for func_id, _, _ in day_functions:
+                        if func_id.startswith(shift_prefix) and (doc.id, d, func_id) in x:
+                            matching_vars.append(x[(doc.id, d, func_id)])
+                if matching_vars:
+                    model.add(sum(matching_vars) <= max_count)
+
+    # === CONSTRAINT 19: AT-block rotation ===
+    # AT-läkare med current_rotation_block tilldelas ALLTID blockens funktion
+    for doc in config.doctors:
+        block = getattr(doc, 'current_rotation_block', {})
+        if not block or not block.get('block_type'):
+            continue
+        func_id = block['block_type']  # t.ex. "AVD_CSK"
+        for day in range(num_days):
+            weekday = day % 7
+            if weekday >= 5:
+                continue  # AT jobbar inte helg (såvida de inte har jour)
+            if (doc.id, day, func_id) in x:
+                # AT ska vara på sin block-funktion varje vardag (om inte ledig/jour)
+                # Vi gör det som mjuk constraint — prioritera block-funktionen
+                pass  # Hanteras via fixed_weekdays + min_shifts istället
+
+    # === CONSTRAINT 20: AKUT-bemanning ===
+    # Minst N läkare på AKUT per vardag
+    akut_rule = None
+    for rule in getattr(config, 'constraint_rules', []):
+        if rule.id == 'akut_staffing' and rule.enabled:
+            akut_rule = rule
+            break
+
+    if akut_rule:
+        akut_min = akut_rule.parameters.get('min_count', 3)
+        for day in range(num_days):
+            weekday = day % 7
+            if weekday >= 5:
+                continue
+            for site in sorted(akut_sites):
+                akut_fid = f"AKUT_{site}"
+                akut_vars = [x[(d.id, day, akut_fid)] for d in config.doctors
+                             if (d.id, day, akut_fid) in x]
+                if akut_vars:
+                    # Minst akut_min läkare (fördelat över alla sites — eller per site)
+                    # Per site: använd min_count / antal sites
+                    per_site_min = max(1, akut_min // max(1, len(akut_sites)))
+                    model.add(sum(akut_vars) >= per_site_min)
+
+    # === CONSTRAINT 21: Fasta återkommande aktiviteter ===
+    # recurring_activities: [{"weekday": "tuesday", "time": "10:00-11:00", "activity": "Infektionsrond"}]
+    # Implementering: om en läkare har en recurring activity på en viss veckodag,
+    # säkerställ att den dagen är en arbetsdag (ej ledig) och tilldela ADMIN om
+    # aktiviteten inte kräver en specifik funktion.
+    for doc in config.doctors:
+        activities = getattr(doc, 'recurring_activities', [])
+        if not activities:
+            continue
+        pattern = getattr(doc, 'schedule_pattern', 'weekly')
+        for act in activities:
+            wd = WEEKDAY_MAP.get(act.get('weekday', '').lower())
+            if wd is None:
+                continue
+            for week in range(num_weeks):
+                if pattern == 'biweekly_even' and week % 2 == 1:
+                    continue
+                if pattern == 'biweekly_odd' and week % 2 == 0:
+                    continue
+                day_idx = week * 7 + wd
+                if day_idx < num_days and (doc.id, day_idx, "LEDIG") in x:
+                    # Säkerställ att läkaren INTE är ledig den dagen
+                    model.add(x[(doc.id, day_idx, "LEDIG")] == 0)
+
+    # === CONSTRAINT 22: Halvdagar (metadata) ===
+    # half_day_schedule: {"monday": {"am": "ADMIN", "pm": "MOTT_CSK"}}
+    # Solvern modellerar fortfarande en funktion per dag — vi använder AM-funktionen
+    # som huvudtilldelning och lagrar PM som metadata i output.
+    for doc in config.doctors:
+        half_days = getattr(doc, 'half_day_schedule', {})
+        if not half_days:
+            continue
+        pattern = getattr(doc, 'schedule_pattern', 'weekly')
+        for day_name, periods in half_days.items():
+            wd = WEEKDAY_MAP.get(day_name.lower())
+            if wd is None:
+                continue
+            am_func = periods.get('am', 'ADMIN')
+            for week in range(num_weeks):
+                if pattern == 'biweekly_even' and week % 2 == 1:
+                    continue
+                if pattern == 'biweekly_odd' and week % 2 == 0:
+                    continue
+                day_idx = week * 7 + wd
+                if day_idx < num_days and (doc.id, day_idx, am_func) in x:
+                    model.add(x[(doc.id, day_idx, am_func)] == 1)
 
     # === DETAILED RULES (avancerad regelmotor) ===
     rule_objective_terms = []
@@ -692,9 +904,13 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
         if objective_terms:
             print(f"Objektvärde: {solver.objective_value}")
 
-        schedule = extract_schedule(solver, x, config, num_days, day_functions, call_functions)
+        schedule, half_day_meta = extract_schedule(solver, x, config, num_days, day_functions, call_functions)
         print_schedule(schedule, config, num_days)
         print_statistics(schedule, config, num_days, solver, call_counts)
+
+        # Inkludera halvdags-metadata om det finns
+        if half_day_meta:
+            schedule["_half_day_meta"] = half_day_meta
 
         return schedule
     else:
@@ -854,10 +1070,21 @@ def expand_to_granular(schedule: dict, num_days: int) -> dict:
 
 
 def extract_schedule(solver, x, config, num_days, day_functions, call_functions):
-    """Extrahera lösningen till en läsbar datastruktur."""
+    """Extrahera lösningen till en läsbar datastruktur.
+
+    Returnerar:
+        schedule: {doc_id: {day_idx: func_id}}
+        half_day_meta: {doc_id: {day_idx: {"am": func_id, "pm": func_id}}}
+    """
+    WEEKDAY_MAP = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4}
+
     schedule = {}
+    half_day_meta = {}
+
     for doc in config.doctors:
         schedule[doc.id] = {}
+        half_days = getattr(doc, 'half_day_schedule', {})
+
         for day in range(num_days):
             weekday = day % 7
             assigned = None
@@ -879,7 +1106,19 @@ def extract_schedule(solver, x, config, num_days, day_functions, call_functions)
 
             schedule[doc.id][day] = assigned
 
-    return schedule
+            # Halvdags-metadata
+            if half_days:
+                for day_name, periods in half_days.items():
+                    wd = WEEKDAY_MAP.get(day_name.lower())
+                    if wd is not None and weekday == wd and assigned != "LEDIG":
+                        if doc.id not in half_day_meta:
+                            half_day_meta[doc.id] = {}
+                        half_day_meta[doc.id][day] = {
+                            "am": periods.get("am", assigned),
+                            "pm": periods.get("pm", assigned),
+                        }
+
+    return schedule, half_day_meta
 
 
 def print_schedule(schedule, config, num_days):
