@@ -30,16 +30,16 @@ from adapters.base import (
 )
 from adapters.tessa_adapter import TessaAdapter
 from adapters.csv_adapter import CSVAdapter
+from adapters.timecare_adapter import TimeCareAdapter
+from adapters.heroma_adapter import HeromaAdapter
 
 
 # Registry: adapter-typ → klass
 ADAPTER_REGISTRY = {
     AdapterType.TESSA: TessaAdapter,
     AdapterType.CSV: CSVAdapter,
-    # Framtida:
-    # AdapterType.TIME_CARE: TimeCareAdapter,
-    # AdapterType.HEROMA: HeromaAdapter,
-    # AdapterType.MEDVIND: MedvindAdapter,
+    AdapterType.TIME_CARE: TimeCareAdapter,
+    AdapterType.HEROMA: HeromaAdapter,
 }
 
 
@@ -190,6 +190,51 @@ class AdapterManager:
         """Stäng adapter."""
         if self.adapter:
             await self.adapter.disconnect()
+
+    # --- Multi-adapter stöd ---
+    _adapters: dict = {}
+
+    @classmethod
+    def register_adapter(cls, adapter_type: AdapterType, adapter: BaseAdapter):
+        """Registrera en aktiv adapter globalt."""
+        cls._adapters[adapter_type] = adapter
+
+    @classmethod
+    def get_adapter(cls, adapter_type: AdapterType) -> Optional[BaseAdapter]:
+        return cls._adapters.get(adapter_type)
+
+    @classmethod
+    async def sync_all(cls, direction: SyncDirection = SyncDirection.PULL) -> dict:
+        """Synka alla anslutna adaptrar."""
+        results = {}
+        for atype, adapter in cls._adapters.items():
+            if adapter.is_connected:
+                try:
+                    if direction == SyncDirection.PULL:
+                        config = await adapter.pull_config()
+                        results[atype.value] = {"success": True, "config": config is not None}
+                    else:
+                        results[atype.value] = {"success": True, "direction": direction.value}
+                except Exception as e:
+                    results[atype.value] = {"success": False, "error": str(e)}
+            else:
+                results[atype.value] = {"success": False, "error": "Ej ansluten"}
+        return results
+
+    @classmethod
+    def get_sync_status(cls) -> dict:
+        """Status per registrerad adapter."""
+        return {
+            atype.value: {
+                "connected": adapter.is_connected,
+                "type": atype.value,
+            }
+            for atype, adapter in cls._adapters.items()
+        }
+
+    @classmethod
+    def get_available_adapters(cls) -> list[str]:
+        return [t.value for t in ADAPTER_REGISTRY.keys()]
 
 
 # === FACTORY ===

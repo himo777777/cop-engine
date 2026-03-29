@@ -4,8 +4,13 @@ COP Engine — Pytest Fixtures
 Delade fixtures för alla tester.
 """
 
-import sys
 import os
+os.environ.setdefault("COP_DB_MODE", "memory")
+os.environ.setdefault("COP_ADMIN_PASSWORD", "cop-admin-2026")
+os.environ.setdefault("COP_SCHEDULER_PASSWORD", "schema-2026")
+os.environ.setdefault("COP_VIEWER_PASSWORD", "viewer-2026")
+
+import sys
 from datetime import date, timedelta
 
 import pytest

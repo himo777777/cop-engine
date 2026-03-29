@@ -24,7 +24,7 @@ class TestRoles:
         assert "ÖL" in roles
 
     def test_role_count(self):
-        assert len(Role) == 5
+        assert len(Role) == 6  # AT, UL, ST_TIDIG, ST_SEN, SP, ÖL
 
 
 class TestDoctor:

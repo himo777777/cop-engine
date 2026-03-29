@@ -30,7 +30,7 @@ from enum import Enum
 from collections import defaultdict
 
 from data_model import (
-    ClinicConfig, Role, Doctor, Function, ShiftType,
+    ClinicConfig, Role, Doctor, Function, ShiftType, is_jour,
 )
 
 
@@ -344,7 +344,7 @@ class AbsenceChain:
                     day_index=slot.day_index,
                     day_date=slot.day_date,
                     function=old_func,
-                    is_call=old_func in ("JOUR_P", "JOUR_B"),
+                    is_call=is_jour(old_func),
                     site=self.FUNCTION_SITE.get(old_func),
                     weekday=slot.weekday,
                 )
@@ -416,7 +416,7 @@ class AbsenceChain:
             if func == "LEDIG":
                 continue  # Redan ledig, inget att ersätta
 
-            is_call = func in ("JOUR_P", "JOUR_B")
+            is_call = is_jour(func)
             site = self.FUNCTION_SITE.get(func)
             weekday = day_date.weekday()
 
@@ -498,7 +498,7 @@ class AbsenceChain:
             yesterday_func = self.schedule.get(doc.id, {}).get(slot.day_index - 1, "LEDIG") if slot.day_index > 0 else "LEDIG"
             tomorrow_func = self.schedule.get(doc.id, {}).get(slot.day_index + 1, "LEDIG") if slot.day_index < self.num_days - 1 else "LEDIG"
 
-            if yesterday_func not in ("JOUR_P", "JOUR_B") and tomorrow_func not in ("JOUR_P", "JOUR_B"):
+            if not is_jour(yesterday_func) and not is_jour(tomorrow_func):
                 score += self.SCORE_ATL_SAFE
                 reasons.append(f"+{self.SCORE_ATL_SAFE} ATL-säker (ingen angränsande jour)")
 
@@ -516,7 +516,7 @@ class AbsenceChain:
             # 8. Straff: jour samma vecka
             week_start = (slot.day_index // 7) * 7
             week_calls = sum(1 for d in range(week_start, min(week_start + 7, self.num_days))
-                           if self.schedule.get(doc.id, {}).get(d) in ("JOUR_P", "JOUR_B"))
+                           if is_jour(self.schedule.get(doc.id, {}).get(d, "LEDIG")))
             if week_calls > 0 and slot.is_call:
                 score += self.PENALTY_CALL_SAME_WEEK
                 reasons.append(f"{self.PENALTY_CALL_SAME_WEEK} redan jour denna vecka")
@@ -554,20 +554,20 @@ class AbsenceChain:
         # 1. Dygnsvila: 11h efter jour
         if slot.day_index > 0:
             yesterday = self.schedule.get(doc_id, {}).get(slot.day_index - 1, "LEDIG")
-            if yesterday in ("JOUR_P", "JOUR_B") and slot.function not in ("LEDIG", "JOUR_P", "JOUR_B"):
+            if is_jour(yesterday) and not is_jour(slot.function) and slot.function != "LEDIG":
                 violations.append("Bryter 11h dygnsvila (jour igår)")
 
         # 2. Dygnsvila: om vi sätter jour, kolla imorgon
         if slot.is_call and slot.day_index < self.num_days - 1:
             tomorrow = self.schedule.get(doc_id, {}).get(slot.day_index + 1, "LEDIG")
-            if tomorrow not in ("LEDIG", "JOUR_P", "JOUR_B"):
+            if tomorrow != "LEDIG" and not is_jour(tomorrow):
                 violations.append("Bryter 11h dygnsvila (arbete imorgon efter jour)")
 
         # 3. Max 1 jour per vecka
         if slot.is_call:
             week_start = (slot.day_index // 7) * 7
             week_calls = sum(1 for d in range(week_start, min(week_start + 7, self.num_days))
-                           if self.schedule.get(doc_id, {}).get(d) in ("JOUR_P", "JOUR_B"))
+                           if is_jour(self.schedule.get(doc_id, {}).get(d, "LEDIG")))
             if week_calls >= 1:
                 violations.append(f"Max 1 jour/vecka ({week_calls} redan denna vecka)")
 
@@ -715,7 +715,7 @@ def run_demo():
     for d in range(14):
         day_date = start_date + timedelta(days=d)
         func = sp1_sched.get(d, "LEDIG")
-        marker = " 🔴" if func in ("JOUR_P", "JOUR_B") else ""
+        marker = " 🔴" if is_jour(func) else ""
         print(f"   {day_date.strftime('%a %d/%m')}: {func}{marker}")
 
     # 3. Simulera sjukdom mån-ons (dag 0-2)

@@ -6,7 +6,7 @@ Parsar svenska regeltexter till strukturerade ConstraintRule-objekt.
 
 import json
 from data_model import ClinicConfig, config_to_dict
-from ai_base import call_claude
+from ai_base import call_claude, _extract_json
 
 SYSTEM_PROMPT = """Du är en regelparser för ett kliniskt schemaläggningssystem.
 
@@ -65,11 +65,15 @@ Returnera JSON-objektet + en kort svensk förklaring av hur regeln tolkas."""}]
     result = await call_claude(SYSTEM_PROMPT, messages, clinic_id=clinic_id)
 
     if result.get("error"):
-        return {"constraint": None, "explanation_sv": "", "confidence": 0.0, "error": result["error"]}
+        return {
+            "constraint": None,
+            "explanation_sv": "",
+            "confidence": 0.0,
+            "error": "AI krävs för regelparser — tjänsten är tillfälligt otillgänglig",
+        }
 
     text = result["text"]
     try:
-        # Extrahera JSON från svaret
         constraint, explanation = _parse_response(text)
         confidence = _estimate_confidence(constraint, rule_text)
         return {
@@ -92,16 +96,14 @@ def _build_context(config: ClinicConfig) -> str:
 
 def _parse_response(text: str) -> tuple[dict, str]:
     """Extrahera JSON-constraint och förklaring från Claude-svar."""
-    # Hitta JSON-block
-    json_start = text.find("{")
-    json_end = text.rfind("}") + 1
-    if json_start == -1 or json_end <= json_start:
+    # Försök extrahera JSON med robust helper
+    constraint = _extract_json(text)
+    if constraint is None:
         raise ValueError("Inget JSON-objekt i svaret")
 
-    constraint = json.loads(text[json_start:json_end])
-
-    # Förklaring = text utanför JSON
-    explanation = text[json_end:].strip()
+    # Förklaring = text efter JSON-blocket (om det finns)
+    json_end = text.rfind("}") + 1
+    explanation = text[json_end:].strip() if json_end > 0 else ""
     if not explanation:
         explanation = f"Regel tillagd: {constraint.get('name', 'okänd')}"
 

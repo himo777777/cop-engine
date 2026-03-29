@@ -6,7 +6,7 @@ Identifierar konflikter mellan befintliga och nya regler.
 
 import json
 from data_model import ClinicConfig, config_to_dict
-from ai_base import call_claude
+from ai_base import call_claude, _extract_json
 
 SYSTEM_PROMPT = """Du är en regelkonfliktanalysator för klinisk schemaläggning.
 
@@ -46,14 +46,63 @@ Finns det konflikter?"""}]
     result = await call_claude(SYSTEM_PROMPT, messages, clinic_id=clinic_id)
 
     if result.get("error"):
-        return {"conflicts": [], "feasibility": "unknown", "suggestions_sv": [], "error": result["error"]}
+        return _rule_based_conflicts(existing, new_rule)
 
-    try:
-        text = result["text"]
-        json_start = text.find("{")
-        json_end = text.rfind("}") + 1
-        parsed = json.loads(text[json_start:json_end])
+    parsed = _extract_json(result["text"])
+    if parsed is not None:
         parsed["error"] = None
         return parsed
-    except Exception as e:
-        return {"conflicts": [], "feasibility": "unknown", "suggestions_sv": [], "error": str(e)}
+
+    return _rule_based_conflicts(existing, new_rule)
+
+
+def _rule_based_conflicts(existing: list[dict], new_rule: dict) -> dict:
+    """
+    Regelbaserad fallback för konfliktdetektering utan AI.
+    Kollar kategori-överlapp och doctor_ids + shift_types-kollisioner.
+    """
+    conflicts = []
+    new_params = new_rule.get("parameters", {})
+    new_doctors = set(new_params.get("doctor_ids", []))
+    new_shifts = set(new_params.get("shift_types", []))
+    new_cat = new_rule.get("category", "")
+    new_is_hard = new_rule.get("is_hard", False)
+
+    # Varning: multipla hårda ATL-regler kan begränsa schemat kraftigt
+    if new_cat == "atl" and new_is_hard:
+        hard_atl = [r for r in existing if r.get("category") == "atl" and r.get("is_hard")]
+        if hard_atl:
+            conflicts.append({
+                "rule_id": hard_atl[0]["id"],
+                "description": f"Flera hårda ATL-regler kan göra schemat svårlöst. Kontrollera med {hard_atl[0]['name']}.",
+                "severity": "medium",
+            })
+
+    # Direkt kollision: samma läkare + samma skift-typ + hård motstridig regel
+    if new_doctors and new_shifts:
+        for r in existing:
+            if not r.get("is_hard"):
+                continue
+            rp = r.get("parameters", {})
+            overlap_docs = new_doctors & set(rp.get("doctor_ids", []))
+            overlap_shifts = new_shifts & set(rp.get("shift_types", []))
+            if overlap_docs and overlap_shifts:
+                conflicts.append({
+                    "rule_id": r["id"],
+                    "description": (
+                        f"Potentiell kollision med '{r['name']}' för "
+                        f"läkare {sorted(overlap_docs)} på skift {sorted(overlap_shifts)}."
+                    ),
+                    "severity": "high",
+                })
+
+    feasibility = "ok"
+    if any(c["severity"] == "high" for c in conflicts):
+        feasibility = "warning"
+
+    return {
+        "conflicts": conflicts,
+        "feasibility": feasibility,
+        "suggestions_sv": ["Granska regeln manuellt — AI-analys ej tillgänglig."] if conflicts else [],
+        "fallback": True,
+    }

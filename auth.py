@@ -20,13 +20,14 @@ Användning:
 import os
 import hashlib
 import secrets
+import time as _time
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
 # JWT — lightweight implementation (PyJWT)
@@ -96,9 +97,10 @@ class UserInDB(BaseModel):
     email: str
     full_name: str
     role: Role
-    doctor_id: Optional[str] = None  # Koppling till data_model doctor ID
+    doctor_id: Optional[str] = None
     hashed_password: str
     is_active: bool = True
+    password_change_required: bool = False
     created_at: datetime = datetime.now(timezone.utc)
     last_login: Optional[datetime] = None
 
@@ -111,6 +113,7 @@ class UserResponse(BaseModel):
     role: Role
     doctor_id: Optional[str] = None
     is_active: bool
+    password_change_required: bool = False
 
 
 class TokenResponse(BaseModel):
@@ -169,6 +172,20 @@ def verify_password(password: str, hashed: str) -> bool:
         return False
 
 
+def validate_password_complexity(password: str) -> None:
+    """Kontrollera att lösenordet uppfyller komplexitetskraven."""
+    if len(password) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Lösenordet måste vara minst 8 tecken",
+        )
+    if not any(c.isdigit() for c in password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Lösenordet måste innehålla minst en siffra",
+        )
+
+
 # ---------------------------------------------------------------------------
 # JWT Token Management
 # ---------------------------------------------------------------------------
@@ -186,6 +203,7 @@ def create_token(user_id: str, username: str, role: str,
         "iat": now,
         "exp": expire,
         "type": "access",
+        "jti": secrets.token_hex(16),
     }
 
     if pyjwt:
@@ -231,7 +249,6 @@ def decode_token(token: str) -> dict:
 # Fallback-kodning utan PyJWT
 def _simple_encode(payload: dict) -> str:
     """Enkel HMAC-baserad token (fallback)."""
-    # Konvertera datetime till timestamp
     serializable = {}
     for k, v in payload.items():
         if isinstance(v, datetime):
@@ -258,7 +275,6 @@ def _simple_decode(token: str) -> dict:
 
     payload = json.loads(base64.urlsafe_b64decode(data))
 
-    # Kontrollera expiration
     if payload.get("exp", 0) < datetime.now(timezone.utc).timestamp():
         raise ValueError("Token expired")
 
@@ -266,86 +282,164 @@ def _simple_decode(token: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# User Store — in-memory primary, syncs to MongoDB when available
+# In-memory cache med 60s TTL
 # ---------------------------------------------------------------------------
 
-_users: dict[str, UserInDB] = {}
-_revoked_tokens: set[str] = set()  # Blacklistade tokens
+_user_cache: dict[str, tuple["UserInDB", float]] = {}  # user_id → (user, expires)
+_username_to_id: dict[str, str] = {}                    # username → user_id
+CACHE_TTL = 60.0
+
+_revoked_hash_cache: set[str] = set()  # SHA-256-hash av token, snabb lookup
 
 
-def _sync_user_to_db(user: "UserInDB"):
-    """Synka användare till MongoDB i bakgrunden (fire-and-forget)."""
-    try:
-        from db import get_db
-        db = get_db()
-        if db.using_mongo:
-            import asyncio
-            data = {
-                "user_id": user.user_id,
-                "username": user.username,
-                "email": user.email,
-                "full_name": user.full_name,
-                "role": user.role.value,
-                "doctor_id": user.doctor_id,
-                "is_active": user.is_active,
-                "hashed_password": user.hashed_password,
-            }
-            asyncio.get_event_loop().create_task(db.save_user(data))
-    except Exception:
-        pass  # Non-critical — in-memory is primary
-
-
-def _init_default_users():
-    """Skapa standardanvändare vid uppstart."""
-    if _users:
-        return
-
-    # Admin-konto
-    admin = UserInDB(
-        user_id="usr_admin",
-        username="admin",
-        email="admin@cop.local",
-        full_name="COP Administrator",
-        role=Role.ADMIN,
-        hashed_password=hash_password(os.getenv("COP_ADMIN_PASSWORD", "cop-admin-2026")),
-    )
-    _users[admin.user_id] = admin
-
-    # Schema-konto (för schemaläggare)
-    scheduler = UserInDB(
-        user_id="usr_scheduler",
-        username="scheduler",
-        email="schema@cop.local",
-        full_name="Schemaläggare",
-        role=Role.SCHEDULER,
-        hashed_password=hash_password("schema-2026"),
-    )
-    _users[scheduler.user_id] = scheduler
-
-    # Viewer-konto (för dashboard)
-    viewer = UserInDB(
-        user_id="usr_viewer",
-        username="viewer",
-        email="viewer@cop.local",
-        full_name="Dashboard Viewer",
-        role=Role.VIEWER,
-        hashed_password=hash_password("viewer-2026"),
-    )
-    _users[viewer.user_id] = viewer
-
-
-_init_default_users()
-
-
-def get_user_by_username(username: str) -> Optional[UserInDB]:
-    for user in _users.values():
-        if user.username == username:
-            return user
+def _cache_get(user_id: str) -> Optional["UserInDB"]:
+    entry = _user_cache.get(user_id)
+    if entry and entry[1] > _time.monotonic():
+        return entry[0]
+    _user_cache.pop(user_id, None)
     return None
 
 
-def get_user_by_id(user_id: str) -> Optional[UserInDB]:
-    return _users.get(user_id)
+def _cache_set(user: "UserInDB") -> None:
+    _user_cache[user.user_id] = (user, _time.monotonic() + CACHE_TTL)
+    _username_to_id[user.username] = user.user_id
+
+
+def _normalize_user_data(data: dict) -> dict:
+    """Normalisera dict från DB/in-memory till UserInDB-kompatibelt format."""
+    normalized = dict(data)
+    # role kan vara en sträng från DB
+    if "role" in normalized and isinstance(normalized["role"], str):
+        normalized["role"] = Role(normalized["role"])
+    # Säkerställ att password_change_required finns
+    normalized.setdefault("password_change_required", False)
+    normalized.setdefault("is_active", True)
+    normalized.setdefault("doctor_id", None)
+    normalized.setdefault("last_login", None)
+    # Sätt created_at om det saknas
+    if "created_at" not in normalized or normalized["created_at"] is None:
+        normalized["created_at"] = datetime.now(timezone.utc)
+    # DB returnerar ibland asyncpg Record — filtrera bort okända fält
+    known = {f for f in UserInDB.model_fields}
+    return {k: v for k, v in normalized.items() if k in known}
+
+
+# ---------------------------------------------------------------------------
+# Token-revokering med SHA-256
+# ---------------------------------------------------------------------------
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+async def _revoke_token(token: str, expires_at: Optional[datetime] = None) -> None:
+    h = _hash_token(token)
+    _revoked_hash_cache.add(h)
+    from db import get_db
+    await get_db().revoke_token(h, expires_at)
+
+
+async def _is_token_revoked(token: str) -> bool:
+    h = _hash_token(token)
+    if h in _revoked_hash_cache:
+        return True
+    from db import get_db
+    return await get_db().is_token_revoked(h)
+
+
+# ---------------------------------------------------------------------------
+# Async User Lookups (cache-first, sedan DB)
+# ---------------------------------------------------------------------------
+
+async def get_user_by_id(user_id: str) -> Optional[UserInDB]:
+    user = _cache_get(user_id)
+    if user:
+        return user
+    from db import get_db
+    data = await get_db().get_user(user_id)
+    if data:
+        user = UserInDB(**_normalize_user_data(data))
+        _cache_set(user)
+        return user
+    return None
+
+
+async def get_user_by_username(username: str) -> Optional[UserInDB]:
+    uid = _username_to_id.get(username)
+    if uid:
+        user = _cache_get(uid)
+        if user:
+            return user
+    from db import get_db
+    data = await get_db().get_user_by_username(username)
+    if data:
+        user = UserInDB(**_normalize_user_data(data))
+        _cache_set(user)
+        return user
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Startup-initiering (kallas från api.py)
+# ---------------------------------------------------------------------------
+
+async def init_auth(db) -> None:
+    """
+    Initierar autentisering vid uppstart.
+    - Laddar existerande användare från DB till cache.
+    - Skapar default-användare om databasen är tom.
+    - Rensar utgångna tokens.
+    Kallas från api.py startup-event efter connect_db().
+    """
+    # Värm upp cache från DB
+    all_users = await db.list_users_full()
+    for data in all_users:
+        try:
+            user = UserInDB(**_normalize_user_data(data))
+            _cache_set(user)
+        except Exception:
+            pass  # Skadad rad — hoppa över
+
+    if _username_to_id:
+        # Användare finns redan — inget att initiera
+        await db.cleanup_expired_tokens()
+        return
+
+    # Skapa default-användare
+    admin_pwd = os.getenv("COP_ADMIN_PASSWORD")
+    if not admin_pwd:
+        admin_pwd = secrets.token_urlsafe(16)
+        print(f"[COP AUTH] Inget COP_ADMIN_PASSWORD satt. "
+              f"Genererat admin-lösenord: {admin_pwd}")
+
+    scheduler_pwd = os.getenv("COP_SCHEDULER_PASSWORD") or secrets.token_urlsafe(16)
+    viewer_pwd = os.getenv("COP_VIEWER_PASSWORD") or secrets.token_urlsafe(16)
+    if not os.getenv("COP_SCHEDULER_PASSWORD"):
+        print(f"[COP AUTH] Genererat scheduler-lösenord: {scheduler_pwd}")
+    if not os.getenv("COP_VIEWER_PASSWORD"):
+        print(f"[COP AUTH] Genererat viewer-lösenord: {viewer_pwd}")
+    print("[COP AUTH] Byt lösenord omedelbart via POST /auth/change-password")
+
+    defaults = [
+        ("usr_admin",     "admin",     "admin@cop.local",  "COP Administrator", Role.ADMIN,     admin_pwd),
+        ("usr_scheduler", "scheduler", "schema@cop.local", "Schemaläggare",     Role.SCHEDULER, scheduler_pwd),
+        ("usr_viewer",    "viewer",    "viewer@cop.local", "Dashboard Viewer",  Role.VIEWER,    viewer_pwd),
+    ]
+
+    for uid, uname, email, name, role, pwd in defaults:
+        user = UserInDB(
+            user_id=uid,
+            username=uname,
+            email=email,
+            full_name=name,
+            role=role,
+            hashed_password=hash_password(pwd),
+            password_change_required=True,
+        )
+        await db.save_user(user.model_dump())
+        _cache_set(user)
+
+    await db.cleanup_expired_tokens()
 
 
 # ---------------------------------------------------------------------------
@@ -372,15 +466,15 @@ async def get_current_user(
 
     payload = decode_token(credentials.credentials)
 
-    # Kontrollera om token är blacklistad
-    jti = payload.get("jti")
-    if jti and jti in _revoked_tokens:
+    # Kontrollera om token är återkallad (via jti eller hela token)
+    jti = payload.get("jti") or credentials.credentials
+    if await _is_token_revoked(jti):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token har återkallats",
         )
 
-    user = get_user_by_id(payload["sub"])
+    user = await get_user_by_id(payload["sub"])
     if not user or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -426,11 +520,8 @@ def require_self_or_role(doctor_id_param: str = "doctor_id", *roles: Role):
         user: CurrentUser = Depends(get_current_user),
         **kwargs,
     ) -> CurrentUser:
-        # Admin/scheduler har alltid åtkomst
         if user.role in roles:
             return user
-        # Läkare kan se sitt eget schema
-        # (doctor_id kontrolleras i endpoint-koden)
         return user
     return _check
 
@@ -444,10 +535,23 @@ from fastapi import APIRouter
 auth_router = APIRouter(prefix="/auth", tags=["Autentisering"])
 
 
+def _user_response(user: UserInDB) -> UserResponse:
+    return UserResponse(
+        user_id=user.user_id,
+        username=user.username,
+        email=user.email,
+        full_name=user.full_name,
+        role=user.role,
+        doctor_id=user.doctor_id,
+        is_active=user.is_active,
+        password_change_required=user.password_change_required,
+    )
+
+
 @auth_router.post("/login", response_model=TokenResponse)
 async def login(req: LoginRequest):
     """Logga in och få JWT tokens."""
-    user = get_user_by_username(req.username)
+    user = await get_user_by_username(req.username)
     if not user or not verify_password(req.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -460,7 +564,6 @@ async def login(req: LoginRequest):
             detail="Kontot är inaktiverat",
         )
 
-    # Uppdatera last_login
     user.last_login = datetime.now(timezone.utc)
 
     access_token = create_token(user.user_id, user.username, user.role.value)
@@ -470,15 +573,7 @@ async def login(req: LoginRequest):
         access_token=access_token,
         refresh_token=refresh_token,
         expires_in=JWT_EXPIRE_HOURS * 3600,
-        user=UserResponse(
-            user_id=user.user_id,
-            username=user.username,
-            email=user.email,
-            full_name=user.full_name,
-            role=user.role,
-            doctor_id=user.doctor_id,
-            is_active=user.is_active,
-        ),
+        user=_user_response(user),
     )
 
 
@@ -490,31 +585,22 @@ async def refresh_token(refresh_token: str):
     if payload.get("type") != "refresh":
         raise HTTPException(status_code=400, detail="Inte en refresh token")
 
-    user = get_user_by_id(payload["sub"])
+    # Återkalla den gamla refresh-token
+    jti = payload.get("jti") or refresh_token
+    await _revoke_token(jti)
+
+    user = await get_user_by_id(payload["sub"])
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="Ogiltigt konto")
 
     new_access = create_token(user.user_id, user.username, user.role.value)
     new_refresh = create_refresh_token(user.user_id)
 
-    # Blacklista gamla refresh token
-    jti = payload.get("jti")
-    if jti:
-        _revoked_tokens.add(jti)
-
     return TokenResponse(
         access_token=new_access,
         refresh_token=new_refresh,
         expires_in=JWT_EXPIRE_HOURS * 3600,
-        user=UserResponse(
-            user_id=user.user_id,
-            username=user.username,
-            email=user.email,
-            full_name=user.full_name,
-            role=user.role,
-            doctor_id=user.doctor_id,
-            is_active=user.is_active,
-        ),
+        user=_user_response(user),
     )
 
 
@@ -526,28 +612,22 @@ async def logout(
     """Logga ut (invalidera token)."""
     if credentials:
         token = credentials.credentials
-        _revoked_tokens.add(token)
-        try:
-            from db import get_db
-            await get_db().revoke_token(token)
-        except Exception:
-            pass
+        payload = decode_token(token)
+        jti = payload.get("jti") or token
+        expires_ts = payload.get("exp")
+        expires_at = (
+            datetime.fromtimestamp(expires_ts, tz=timezone.utc)
+            if expires_ts else None
+        )
+        await _revoke_token(jti, expires_at)
     return {"message": f"Utloggad: {user.username}"}
 
 
 @auth_router.get("/me", response_model=UserResponse)
 async def get_me(user: CurrentUser = Depends(get_current_user)):
     """Hämta info om inloggad användare."""
-    db_user = get_user_by_id(user.user_id)
-    return UserResponse(
-        user_id=db_user.user_id,
-        username=db_user.username,
-        email=db_user.email,
-        full_name=db_user.full_name,
-        role=db_user.role,
-        doctor_id=db_user.doctor_id,
-        is_active=db_user.is_active,
-    )
+    db_user = await get_user_by_id(user.user_id)
+    return _user_response(db_user)
 
 
 @auth_router.post("/change-password")
@@ -556,11 +636,17 @@ async def change_password(
     user: CurrentUser = Depends(get_current_user),
 ):
     """Byt lösenord."""
-    db_user = get_user_by_id(user.user_id)
+    db_user = await get_user_by_id(user.user_id)
     if not verify_password(req.old_password, db_user.hashed_password):
         raise HTTPException(status_code=400, detail="Fel nuvarande lösenord")
 
+    validate_password_complexity(req.new_password)
+
     db_user.hashed_password = hash_password(req.new_password)
+    db_user.password_change_required = False
+    from db import get_db
+    await get_db().save_user(db_user.model_dump())
+    _cache_set(db_user)
     return {"message": "Lösenord uppdaterat"}
 
 
@@ -569,18 +655,25 @@ async def change_password(
 @auth_router.get("/users", response_model=list[UserResponse])
 async def list_users(user: CurrentUser = Depends(require_role(Role.ADMIN))):
     """Lista alla användare (admin)."""
-    return [
-        UserResponse(
-            user_id=u.user_id,
-            username=u.username,
-            email=u.email,
-            full_name=u.full_name,
-            role=u.role,
-            doctor_id=u.doctor_id,
-            is_active=u.is_active,
-        )
-        for u in _users.values()
-    ]
+    from db import get_db
+    rows = await get_db().list_users()
+    result = []
+    for row in rows:
+        # list_users returnerar rader utan hashed_password — komplettera från cache
+        uid = row.get("user_id")
+        cached = _cache_get(uid)
+        pcr = cached.password_change_required if cached else row.get("password_change_required", False)
+        result.append(UserResponse(
+            user_id=row["user_id"],
+            username=row["username"],
+            email=row.get("email", ""),
+            full_name=row.get("full_name", ""),
+            role=Role(row["role"]),
+            doctor_id=row.get("doctor_id"),
+            is_active=row.get("is_active", True),
+            password_change_required=pcr,
+        ))
+    return result
 
 
 @auth_router.post("/users", response_model=UserResponse)
@@ -589,8 +682,10 @@ async def create_user(
     user: CurrentUser = Depends(require_role(Role.ADMIN)),
 ):
     """Skapa ny användare (admin)."""
-    if get_user_by_username(req.username):
+    if await get_user_by_username(req.username):
         raise HTTPException(status_code=409, detail="Användarnamnet är upptaget")
+
+    validate_password_complexity(req.password)
 
     user_id = f"usr_{secrets.token_hex(6)}"
     new_user = UserInDB(
@@ -601,19 +696,13 @@ async def create_user(
         role=req.role,
         doctor_id=req.doctor_id,
         hashed_password=hash_password(req.password),
+        password_change_required=False,
     )
-    _users[user_id] = new_user
-    _sync_user_to_db(new_user)
+    from db import get_db
+    await get_db().save_user(new_user.model_dump())
+    _cache_set(new_user)
 
-    return UserResponse(
-        user_id=new_user.user_id,
-        username=new_user.username,
-        email=new_user.email,
-        full_name=new_user.full_name,
-        role=new_user.role,
-        doctor_id=new_user.doctor_id,
-        is_active=new_user.is_active,
-    )
+    return _user_response(new_user)
 
 
 @auth_router.patch("/users/{user_id}", response_model=UserResponse)
@@ -623,7 +712,7 @@ async def update_user(
     user: CurrentUser = Depends(require_role(Role.ADMIN)),
 ):
     """Uppdatera användare (admin)."""
-    target = get_user_by_id(user_id)
+    target = await get_user_by_id(user_id)
     if not target:
         raise HTTPException(status_code=404, detail="Användaren finns inte")
 
@@ -638,12 +727,8 @@ async def update_user(
     if req.is_active is not None:
         target.is_active = req.is_active
 
-    return UserResponse(
-        user_id=target.user_id,
-        username=target.username,
-        email=target.email,
-        full_name=target.full_name,
-        role=target.role,
-        doctor_id=target.doctor_id,
-        is_active=target.is_active,
-    )
+    from db import get_db
+    await get_db().save_user(target.model_dump())
+    _cache_set(target)
+
+    return _user_response(target)

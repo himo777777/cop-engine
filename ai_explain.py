@@ -6,7 +6,7 @@ Förklarar schemaläggningsbeslut på svenska.
 
 import json
 from data_model import ClinicConfig
-from ai_base import call_claude
+from ai_base import call_claude, _extract_json
 
 SYSTEM_PROMPT = """Du är en schemaförklarare för ett kliniskt schemaläggningssystem.
 
@@ -65,14 +65,42 @@ Förklara varför {doc.name} fick {assignment} denna dag."""}]
     result = await call_claude(SYSTEM_PROMPT, messages, clinic_id=clinic_id)
 
     if result.get("error"):
-        return {"explanation_sv": "", "constraints_applied": [], "alternatives_considered": [], "error": result["error"]}
+        return _constraint_fallback(config, doctor_id, date_str, assignment)
 
-    try:
-        text = result["text"]
-        json_start = text.find("{")
-        json_end = text.rfind("}") + 1
-        parsed = json.loads(text[json_start:json_end])
+    parsed = _extract_json(result["text"])
+    if parsed is not None:
         parsed["error"] = None
         return parsed
-    except Exception as e:
-        return {"explanation_sv": result.get("text", ""), "constraints_applied": [], "alternatives_considered": [], "error": str(e)}
+
+    return _constraint_fallback(config, doctor_id, date_str, assignment)
+
+
+def _constraint_fallback(config: ClinicConfig, doctor_id: str, date_str: str, assignment: str) -> dict:
+    """
+    Fallback: lista aktiva hårda constraints som potentiellt påverkade tilldelningen.
+    """
+    hard_rules = [r for r in config.constraint_rules if r.enabled and r.is_hard]
+    rule_names = [r.name for r in hard_rules]
+    n = len(rule_names)
+
+    if rule_names:
+        names_str = ", ".join(rule_names[:5])
+        if n > 5:
+            names_str += f" (+{n - 5} fler)"
+        explanation = (
+            f"Schemaläggning baserad på {n} aktiva hårda regler: {names_str}. "
+            f"AI-förklaring ej tillgänglig — kontakta schemaadministratören för detaljer."
+        )
+    else:
+        explanation = f"Inga aktiva hårda regler. Tilldelningen {assignment} gjordes utan bindande constraints."
+
+    constraint_ids = [r.id for r in hard_rules[:10]]
+
+    return {
+        "explanation_sv": explanation,
+        "constraints_applied": constraint_ids,
+        "alternatives_considered": [],
+        "quality": "acceptable",
+        "error": None,
+        "fallback": True,
+    }

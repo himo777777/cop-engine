@@ -13,6 +13,7 @@ from typing import Optional
 
 class Role(Enum):
     """Läkarroller i hierarkin."""
+    AT = "AT"                  # AT-läkare (allmäntjänstgöring)
     UNDERLÄKARE = "UL"
     ST_TIDIG = "ST_TIDIG"      # ST år 1-3
     ST_SEN = "ST_SEN"          # ST år 4-5
@@ -37,6 +38,13 @@ class Function(Enum):
     AKUTMOTTAGNING = "AKUT"
     PRIMÄRJOUR = "JOUR_PRIMÄR"
     BAKJOUR = "JOUR_BAK"
+    # Granulära jourtyper (används i expanderat schema)
+    JOUR_P_KVÄLL = "JOUR_P_KVÄLL"        # Primärjour kväll 16:30-22:00
+    JOUR_P_NATT = "JOUR_P_NATT"          # Primärjour natt 22:00-07:00
+    JOUR_P_HELGDAG = "JOUR_P_HELGDAG"    # Primärjour helgdag 07:00-22:00
+    JOUR_P_HELGNATT = "JOUR_P_HELGNATT"  # Primärjour helgnatt 22:00-07:00
+    JOUR_B_HELGDAG = "JOUR_B_HELGDAG"    # Bakjour helgdag
+    JOUR_B_HELGNATT = "JOUR_B_HELGNATT"  # Bakjour helgnatt
     ADMIN = "ADMIN"            # MDT, rond, utbildning
     LEDIG = "LEDIG"
     SEMESTER = "SEMESTER"
@@ -52,6 +60,7 @@ class Doctor:
     id: str
     name: str
     role: Role
+    personal_number: str = ""               # Personnummer (för lönekoppling)
     site_preference: Optional[str] = None   # None = roterar mellan alla sites
     employment_rate: float = 1.0            # 1.0 = heltid, 0.8 = 80%
     can_primary_call: bool = False
@@ -97,6 +106,24 @@ class CallStructure:
     max_weekend_frequency: int = 4
     rest_after_night: bool = True
     backup_is_on_site: bool = False
+    couple_evening_night: bool = True   # Kväll+natt alltid samma person
+    backup_from_home: bool = True       # Bakjour = beredskapsjour hemifrån
+    weekend_comp_primary: bool = True   # Helgkomp för primärjour (hård)
+    weekend_comp_backup: bool = True    # Helgkomp för bakjour (mjuk)
+
+
+# Alla func_id:n som representerar jour
+JOUR_FUNC_IDS = frozenset({
+    "JOUR_P", "JOUR_B",
+    "JOUR_P_KVÄLL", "JOUR_P_NATT",
+    "JOUR_P_HELGDAG", "JOUR_P_HELGNATT",
+    "JOUR_B_HELGDAG", "JOUR_B_HELGNATT",
+})
+
+
+def is_jour(func_id: str) -> bool:
+    """Returnerar True om func_id är en jourtyp."""
+    return func_id in JOUR_FUNC_IDS
 
 
 @dataclass
@@ -110,6 +137,16 @@ class ATLRules:
     max_work_plus_call_hours: float = 20.0
     max_overtime_per_year: float = 200.0
     max_break_interval_hours: float = 5.0
+
+
+@dataclass
+class OBRates:
+    """OB-tillägg per tidsperiod (multiplikator)."""
+    weekday_evening: float = 1.0    # Vardag 18-22
+    weekday_night: float = 1.5      # Vardag 22-06
+    saturday_day: float = 1.2       # Lördag 07-22
+    sunday_day: float = 1.5         # Söndag/helgdag 07-22
+    weekend_night: float = 2.0      # Helg 22-07
 
 
 @dataclass
@@ -173,6 +210,10 @@ def default_constraint_rules() -> list[ConstraintRule]:
                        is_hard=False, weight=3, parameters={}),
         ConstraintRule("max_workdays", "Max 5 arbetsdagar per vecka", "atl",
                        is_hard=True, weight=10, parameters={"max_days": 5}),
+        ConstraintRule("weekend_compensation", "Ledig vardag efter helgjour", "fairness",
+                       is_hard=False, weight=7, parameters={}),
+        ConstraintRule("ob_cost_fairness", "Rättvis OB-fördelning", "fairness",
+                       is_hard=False, weight=4, parameters={}),
     ]
 
 
@@ -190,7 +231,127 @@ class ClinicConfig:
     shift_definitions: list[ShiftDefinition] = field(default_factory=list)
     constraint_rules: list[ConstraintRule] = field(default_factory=default_constraint_rules)
     schedule_cycle_weeks: int = 10
+    max_concurrent_vacation: int = 0   # 0 = auto: ceil(len(doctors) * 0.2)
     travel_time_between_sites_min: int = 0
+    ob_rates: OBRates = field(default_factory=OBRates)
+    optimize_ob_cost: bool = True
+    detailed_rules: list = field(default_factory=list)  # list[DetailedRule] från rule_engine
+    comp_time_rates: "CompTimeRates" = None
+    auto_plan_comp_days: bool = True
+    max_comp_balance_days: float = 20.0
+
+
+# === GRUNDSCHEMA ===
+
+@dataclass
+class BaseScheduleSlot:
+    """En position i grundschemat."""
+    doctor_id: str
+    cycle_week: int
+    weekday: int
+    function: str
+    site: str = None
+
+@dataclass
+class BaseSchedule:
+    """Komplett grundschema — den roterande cykeln."""
+    id: str
+    name: str
+    clinic_id: str
+    cycle_length_weeks: int = 10
+    slots: list = field(default_factory=list)
+    effective_from: str = None
+    effective_to: str = None
+    created_at: str = None
+    version: int = 1
+
+@dataclass
+class ScheduleDeviation:
+    """En avvikelse från grundschemat."""
+    id: str
+    base_schedule_id: str
+    date: str
+    doctor_id: str
+    original_function: str
+    new_function: str
+    reason: str
+    approved_by: str = None
+    created_at: str = None
+
+
+# === KOMPENSATIONSTID ===
+
+@dataclass
+class CompTimeEntry:
+    """En post i kompensationstidkontot."""
+    id: str
+    doctor_id: str
+    date: str
+    call_type: str
+    hours_earned: float
+    hours_used: float = 0.0
+    status: str = "pending"
+    planned_date: str = None
+
+@dataclass
+class CompTimeAccount:
+    """Kompensationstidkonto per läkare."""
+    doctor_id: str
+    entries: list = field(default_factory=list)
+
+    @property
+    def balance_hours(self) -> float:
+        return sum(e.hours_earned - e.hours_used for e in self.entries if e.status != "expired")
+
+    @property
+    def balance_days(self) -> float:
+        return self.balance_hours / 8.0
+
+@dataclass
+class CompTimeRates:
+    """Kompensationstid per jourtyp."""
+    weekday_evening: float = 4.0
+    weekday_night: float = 8.0
+    weekend_day: float = 8.0
+    weekend_night: float = 10.0
+    holiday_day: float = 12.0
+    holiday_night: float = 14.0
+
+
+# === PEER-TO-PEER BYTE ===
+
+class SwapRequestStatus(Enum):
+    PENDING_PEER = "pending_peer"
+    PEER_ACCEPTED = "peer_accepted"
+    PEER_REJECTED = "peer_rejected"
+    ATL_VALIDATED = "atl_validated"
+    ATL_WARNING = "atl_warning"
+    PENDING_ADMIN = "pending_admin"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+
+@dataclass
+class SwapRequest:
+    """Bytesförfrågan mellan två läkare."""
+    id: str
+    clinic_id: str
+    requester_id: str
+    requester_date: str
+    requester_function: str
+    target_id: str
+    target_date: str
+    target_function: str
+    status: str = "pending_peer"
+    message: str = ""
+    atl_warnings: list = field(default_factory=list)
+    peer_response_at: str = None
+    admin_response_at: str = None
+    admin_id: str = None
+    created_at: str = None
+    expires_at: str = None
+    completed_at: str = None
 
 
 def create_kristianstad_example() -> ClinicConfig:
@@ -334,11 +495,15 @@ def create_kristianstad_example() -> ClinicConfig:
         max_weekend_frequency=4,
         rest_after_night=True,
         backup_is_on_site=False,
+        couple_evening_night=True,
+        backup_from_home=True,
+        weekend_comp_primary=True,
+        weekend_comp_backup=True,
     )
 
     preferences = [
-        Preference("OL1", "SEMESTER", 1, {"start_week": 28, "end_week": 30}),
-        Preference("SP2", "SEMESTER", 1, {"start_week": 29, "end_week": 31}),
+        Preference("OL1", "SEMESTER_BLOCK", 1, {"start_week": 0, "end_week": 0}),
+        Preference("SP2", "SEMESTER_BLOCK", 2, {"start_week": 1, "end_week": 1}),
         Preference("ST1", "OP_PREF", 2, {"want_procedure": "höftprotes", "want_with": "SP1"}),
         Preference("SP5", "SKIFT_PREF", 3, {"avoid": "NATT"}),
         Preference("OL5", "LEDIG_DAG", 1, {"weekday": 4}),
@@ -526,10 +691,22 @@ def _role_from_str(s: str) -> Role:
     return Role.UNDERLÄKARE
 
 def _func_from_str(s: str) -> Function:
+    if not s:
+        return Function.LEDIG
     for f in Function:
         if f.value == s:
             return f
-    return Function.LEDIG
+    # Stöd för alternativa namngivningar
+    mapping = {
+        "regular": Function.LEDIG,
+        "jour": Function.PRIMÄRJOUR,
+        "operation": Function.OPERATION,
+        "mottagning": Function.MOTTAGNING,
+        "avdelning": Function.AVDELNING,
+        "admin": Function.ADMIN,
+        "trauma": Function.AKUTMOTTAGNING,
+    }
+    return mapping.get(s.lower(), Function.LEDIG)
 
 def _shift_from_str(s: str) -> ShiftType:
     for st in ShiftType:
@@ -594,9 +771,12 @@ def dict_to_config(data: dict) -> ClinicConfig:
     ]
     shifts = [
         ShiftDefinition(
-            id=s["id"], name=s["name"], function=_func_from_str(s["function"]),
-            site=s["site"], start_time=s.get("start_time", "07:00"),
-            end_time=s.get("end_time", "16:30"), duration_hours=s.get("duration_hours", 9.5),
+            id=s["id"], name=s["name"],
+            function=_func_from_str(s.get("function") or s.get("type") or s.get("shift_type", "")),
+            site=s.get("site", ""),
+            start_time=s.get("start_time") or s.get("start", "07:00"),
+            end_time=s.get("end_time") or s.get("end", "16:30"),
+            duration_hours=s.get("duration_hours", 9.5),
             min_staff=s.get("min_staff", 1), max_staff=s.get("max_staff", 10),
             required_roles=[_role_from_str(r) for r in s.get("required_roles", [])],
             required_competencies=s.get("required_competencies", []),

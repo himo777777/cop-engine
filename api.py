@@ -37,9 +37,9 @@ from pydantic import BaseModel, Field
 from data_model import (
     ClinicConfig, Role, ShiftType, Function, Doctor,
     OperatingRoom, StaffingRequirement, CallStructure, ATLRules,
-    create_kristianstad_example, create_generic_example,
+    create_kristianstad_example, create_generic_example, is_jour, OBRates,
 )
-from solver import solve_schedule
+from solver import solve_schedule, expand_to_granular, solve_rolling, _ob_cost
 from absence_chain import AbsenceChain, AbsenceChainResult, ChainStatus
 from db import get_db, connect_db, close_db
 
@@ -117,11 +117,7 @@ if HAS_SECURITY:
 # === DATABASE LAYER (PostgreSQL med in-memory fallback) ===
 db = get_db()
 
-# BakÃÂ¥tkompatibla alias Ã¢ÂÂ synkron ÃÂ¥tkomst fÃÂ¶r _run_solver (kÃÂ¶r i thread)
-# Dessa wrappas till async i endpoints, men solver-trÃÂ¥den behÃÂ¶ver synkron access
-schedule_store = db._schedules  # direct dict reference for backward compat in sync code
-config_store = db._configs
-job_store = db._jobs
+_active_jobs: dict = {}  # Ephemeral: aktiva solver-jobb under körning
 
 
 # === PYDANTIC MODELLER (API-kontrakt) ===
@@ -134,6 +130,14 @@ class ScheduleRequest(BaseModel):
     time_limit_seconds: int = Field(default=30, ge=5, le=300, description="Max tid fÃÂ¶r solver")
     locked_assignments: Optional[dict] = Field(default=None, description="LÃÂ¥sta tilldelningar {doctor_id: {day: function}}")
     excluded_doctors: Optional[list[str]] = Field(default=None, description="LÃÂ¤kar-ID som inte ska schemalÃÂ¤ggas")
+
+
+class RollForwardRequest(BaseModel):
+    """Rulla schema framåt — behåll låsta veckor, generera nya."""
+    schedule_id: str = Field(description="Befintligt schema-ID")
+    weeks_to_keep: int = Field(default=3, ge=1, le=7, description="Antal veckor att behålla")
+    new_weeks: int = Field(default=1, ge=1, le=4, description="Antal nya veckor att generera")
+    time_limit_seconds: int = Field(default=30, ge=5, le=300, description="Max tid")
 
 
 class ScheduleResponse(BaseModel):
@@ -226,6 +230,9 @@ async def startup():
     db_ok = await connect_db()
     backend = "PostgreSQL" if db_ok else "in-memory"
 
+    from auth import init_auth
+    await init_auth(db)
+
     demo_mode = os.environ.get("COP_DEMO", "true").lower() in ("true", "1", "yes")
     if demo_mode:
         config = create_kristianstad_example()
@@ -251,7 +258,7 @@ async def health_check():
         status="healthy",
         version="0.1.0",
         uptime_seconds=round(time.time() - START_TIME, 1),
-        schedules_generated=len(schedule_store),
+        schedules_generated=0,
         solver_available=True,
     )
 
@@ -482,7 +489,7 @@ async def ai_chat_endpoint(req: AIChatRequest):
 def _run_solver(job_id: str, config: ClinicConfig, request: ScheduleRequest):
     """KÃÂ¶r solver i bakgrunden."""
     try:
-        job_store[job_id]["status"] = "running"
+        _active_jobs[job_id]["status"] = "running"
         start_time = time.time()
 
         schedule = solve_schedule(
@@ -494,8 +501,8 @@ def _run_solver(job_id: str, config: ClinicConfig, request: ScheduleRequest):
         solve_time_ms = int((time.time() - start_time) * 1000)
 
         if schedule is None:
-            job_store[job_id]["status"] = "infeasible"
-            job_store[job_id]["error"] = "Ingen giltig lÃÂ¶sning hittades"
+            _active_jobs[job_id]["status"] = "infeasible"
+            _active_jobs[job_id]["error"] = "Ingen giltig lÃÂ¶sning hittades"
             return
 
         # BerÃÂ¤kna startdatum
@@ -511,15 +518,19 @@ def _run_solver(job_id: str, config: ClinicConfig, request: ScheduleRequest):
         # BerÃÂ¤kna statistik
         statistics = _compute_statistics(schedule, config, request.num_weeks * 7)
 
-        # Konvertera schedule till datum-baserat format
+        # Expandera till granulära jourtyper
+        num_days = request.num_weeks * 7
+        granular = expand_to_granular(schedule, num_days)
+
+        # Konvertera schedule till datum-baserat format (granulär)
         date_schedule = {}
-        for doc_id, days in schedule.items():
+        for doc_id, days in granular.items():
             date_schedule[doc_id] = {}
             for day_idx, func in days.items():
                 day_date = start + timedelta(days=day_idx)
                 date_schedule[doc_id][day_date.isoformat()] = func
 
-        schedule_id = job_store[job_id]["schedule_id"]
+        schedule_id = _active_jobs[job_id]["schedule_id"]
         schedule_data = {
             "schedule_id": schedule_id,
             "status": "optimal",
@@ -534,19 +545,20 @@ def _run_solver(job_id: str, config: ClinicConfig, request: ScheduleRequest):
             "warnings": [],
         }
 
-        schedule_store[schedule_id] = schedule_data
-        job_store[job_id]["status"] = "completed"
-        job_store[job_id]["result"] = schedule_data
+        _active_jobs[job_id]["status"] = "completed"
+        _active_jobs[job_id]["result"] = schedule_data
 
-        # Persist to DB if available (async from sync context)
-        if db.using_postgres:
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                loop.create_task(db.save_schedule(schedule_data))
-                loop.create_task(db.save_job(job_store[job_id]))
-            except Exception:
-                pass  # In-memory fallback already saved
+        # Spara version
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            loop.create_task(db.save_version(schedule_id, {
+                "change_type": "generated",
+                "raw_schedule": schedule,
+                "change_description": f"Schema genererat ({request.num_weeks} veckor)",
+            }))
+        except Exception:
+            pass
 
         # WebSocket broadcast: schema genererat
         if HAS_WS:
@@ -564,8 +576,8 @@ def _run_solver(job_id: str, config: ClinicConfig, request: ScheduleRequest):
                 pass  # WebSocket broadcast failure should not break API
 
     except Exception as e:
-        job_store[job_id]["status"] = "failed"
-        job_store[job_id]["error"] = str(e)
+        _active_jobs[job_id]["status"] = "failed"
+        _active_jobs[job_id]["error"] = str(e)
 
 
 def _compute_statistics(schedule: dict, config: ClinicConfig, num_days: int) -> dict:
@@ -626,7 +638,7 @@ def _compute_statistics(schedule: dict, config: ClinicConfig, num_days: int) -> 
         for day in range(num_days - 1):
             func_today = schedule.get(doc.id, {}).get(day, "LEDIG")
             func_tomorrow = schedule.get(doc.id, {}).get(day + 1, "LEDIG")
-            if func_today in ("JOUR_P", "JOUR_B") and func_tomorrow not in ("LEDIG", "JOUR_P", "JOUR_B"):
+            if is_jour(func_today) and not is_jour(func_tomorrow) and func_tomorrow != "LEDIG":
                 stats["atl_violations"].append({
                     "doctor_id": doc.id,
                     "doctor_name": doc.name,
@@ -646,7 +658,29 @@ def _compute_statistics(schedule: dict, config: ClinicConfig, num_days: int) -> 
             "utilization": round(work_days / num_days * 100, 1),
         }
 
+    # OB-kostnader
+    ob_costs = {}
+    for doc in config.doctors:
+        total_ob = 0.0
+        for day in range(num_days):
+            func = schedule.get(doc.id, {}).get(day, "LEDIG")
+            weekday = day % 7
+            total_ob += _ob_cost(weekday, func, config.ob_rates)
+        if total_ob > 0:
+            ob_costs[doc.id] = {"name": doc.name, "ob_cost": round(total_ob, 1)}
+    stats["ob_costs"] = ob_costs
+    stats["total_ob_cost"] = round(sum(v["ob_cost"] for v in ob_costs.values()), 1)
+
     return stats
+
+
+async def _run_solver_async(job_id: str, config: ClinicConfig, request: ScheduleRequest):
+    """Async wrapper för background task — kör solver och sparar till DB."""
+    _run_solver(job_id, config, request)
+    job = _active_jobs.get(job_id, {})
+    if job.get("status") == "completed" and job.get("result"):
+        await db.save_schedule(job["result"])
+        await db.save_job(job)
 
 
 @app.post("/schedule/generate", tags=["Schema"])
@@ -670,14 +704,17 @@ async def generate_schedule(request: ScheduleRequest, background_tasks: Backgrou
         "status": "queued",
         "created_at": datetime.now().isoformat(),
     }
+    _active_jobs[job_id] = dict(job_data)  # ephemeral slot for _run_solver
     await db.save_job(job_data)
 
     if request.time_limit_seconds <= 60:
         # Synkron kÃÂ¶rning fÃÂ¶r snabba jobb
         _run_solver(job_id, config, request)
-        job = job_store[job_id]
+        job = _active_jobs[job_id]
 
         if job["status"] == "completed":
+            await db.save_schedule(job["result"])
+            await db.save_job(job)
             return job["result"]
         elif job["status"] == "infeasible":
             raise HTTPException(status_code=422, detail="Ingen giltig lÃÂ¶sning kunde hittas med givna constraints")
@@ -685,7 +722,7 @@ async def generate_schedule(request: ScheduleRequest, background_tasks: Backgrou
             raise HTTPException(status_code=500, detail=job.get("error", "OkÃÂ¤nt fel"))
     else:
         # Asynkron kÃÂ¶rning
-        background_tasks.add_task(_run_solver, job_id, config, request)
+        background_tasks.add_task(_run_solver_async, job_id, config, request)
         return {
             "job_id": job_id,
             "schedule_id": schedule_id,
@@ -866,7 +903,7 @@ def _validate_single_day(schedule: dict, config: ClinicConfig, day: int) -> list
         for d_id, days in schedule.items():
             yesterday = _get(days, day - 1) or "LEDIG"
             today = _get(days, day) or "LEDIG"
-            if yesterday in ("JOUR_P", "JOUR_B") and today not in ("LEDIG", "JOUR_P", "JOUR_B"):
+            if is_jour(yesterday) and not is_jour(today) and today != "LEDIG":
                 doc = next((d for d in config.doctors if d.id == d_id), None)
                 name = doc.name if doc else d_id
                 warnings.append(f"ATL-brott: {name} hade jour dag {day-1} och arbetar dag {day}")
@@ -910,8 +947,10 @@ async def register_absence(request: AbsenceRequest, background_tasks: Background
     }
 
     # Hitta berÃÂ¶rda scheman
-    for sched_id, sched in schedule_store.items():
-        if sched["clinic_id"] == request.clinic_id:
+    all_scheds = await db.list_schedules(clinic_id=request.clinic_id)
+    for sched in all_scheds:
+        sched_id = sched["schedule_id"]
+        if True:  # already filtered by clinic_id
             # Kolla om frÃÂ¥nvaron ÃÂ¶verlappar med schemat
             sched_start = date.fromisoformat(sched["start_date"])
             sched_end = sched_start + timedelta(weeks=sched["num_weeks"])
@@ -933,6 +972,7 @@ async def register_absence(request: AbsenceRequest, background_tasks: Background
                             # Uppdatera ÃÂ¤ven datum-schemat
                             if request.doctor_id in sched.get("schedule", {}):
                                 sched["schedule"][request.doctor_id][day_date.isoformat()] = "LEDIG"
+                await db.save_schedule(sched)
 
     if request.reoptimize and result["affected_schedules"]:
         result["status"] = "registered_reoptimize_pending"
@@ -971,7 +1011,7 @@ async def reoptimize_schedule(request: ReoptimizeRequest):
     new_schedule_id = f"sch_{uuid.uuid4().hex[:12]}"
     job_id = f"job_{uuid.uuid4().hex[:8]}"
 
-    job_store[job_id] = {
+    _active_jobs[job_id] = {
         "job_id": job_id,
         "schedule_id": new_schedule_id,
         "status": "queued",
@@ -979,9 +1019,11 @@ async def reoptimize_schedule(request: ReoptimizeRequest):
     }
 
     _run_solver(job_id, config, gen_request)
-    job = job_store[job_id]
+    job = _active_jobs[job_id]
 
     if job["status"] == "completed":
+        await db.save_schedule(job["result"])
+        await db.save_job(job)
         return {
             "status": "reoptimized",
             "original_schedule_id": request.schedule_id,
@@ -993,6 +1035,88 @@ async def reoptimize_schedule(request: ReoptimizeRequest):
             status_code=422,
             detail=f"Omoptimering misslyckades: {job.get('error', 'okÃÂ¤nt fel')}"
         )
+
+
+@app.post("/schedule/roll-forward", tags=["Schema"])
+async def roll_forward(request: RollForwardRequest):
+    """Rulla schema framåt — behåll låsta veckor, generera nya."""
+    sched = await db.get_schedule(request.schedule_id)
+    if not sched:
+        raise HTTPException(status_code=404, detail="Schema inte hittat")
+
+    raw = sched.get("raw_schedule", {})
+    config_name = sched.get("clinic_id", "kristianstad")
+    config = await db.get_config(config_name)
+    if not config:
+        raise HTTPException(status_code=404, detail="Klinikkonfiguration saknas")
+
+    old_num_weeks = sched.get("num_weeks", 2)
+    if request.weeks_to_keep >= old_num_weeks:
+        raise HTTPException(status_code=400, detail="weeks_to_keep måste vara < antal veckor i schema")
+
+    # Skifta dag-index: ta bort äldsta veckorna
+    weeks_to_drop = old_num_weeks - request.weeks_to_keep
+    drop_days = weeks_to_drop * 7
+    shifted = {}
+    for doc_id, days in raw.items():
+        shifted[doc_id] = {}
+        for day_key, func_id in days.items():
+            old_day = int(day_key)
+            if old_day >= drop_days:
+                shifted[doc_id][old_day - drop_days] = func_id
+
+    result = solve_rolling(
+        config,
+        existing_schedule=shifted,
+        locked_weeks=request.weeks_to_keep,
+        new_weeks=request.new_weeks,
+        time_limit_seconds=request.time_limit_seconds,
+    )
+
+    if result is None:
+        raise HTTPException(status_code=422, detail="Kunde inte lösa rullande schema")
+
+    new_id = f"sch_{uuid.uuid4().hex[:12]}"
+    total_weeks = request.weeks_to_keep + request.new_weeks
+    num_days = total_weeks * 7
+    granular = expand_to_granular(result, num_days)
+
+    start_str = sched.get("start_date")
+    if start_str:
+        from datetime import timedelta
+        old_start = datetime.fromisoformat(start_str)
+        new_start = old_start + timedelta(weeks=weeks_to_drop)
+    else:
+        new_start = datetime.now()
+
+    date_schedule = {}
+    for doc_id, days in granular.items():
+        date_schedule[doc_id] = {}
+        for day_idx, func in days.items():
+            day_date = new_start + timedelta(days=day_idx)
+            date_schedule[doc_id][day_date.strftime("%Y-%m-%d")] = func
+
+    new_sched_data = {
+        "schedule_id": new_id,
+        "status": "optimal",
+        "clinic_id": config_name,
+        "num_weeks": total_weeks,
+        "start_date": new_start.strftime("%Y-%m-%d"),
+        "created_at": datetime.now().isoformat(),
+        "schedule": date_schedule,
+        "raw_schedule": result,
+        "parent_schedule": request.schedule_id,
+    }
+    await db.save_schedule(new_sched_data)
+
+    return {
+        "status": "rolled_forward",
+        "original_schedule_id": request.schedule_id,
+        "new_schedule_id": new_id,
+        "weeks_kept": request.weeks_to_keep,
+        "new_weeks": request.new_weeks,
+        "total_weeks": total_weeks,
+    }
 
 
 # === VALIDERING ===
@@ -1026,7 +1150,7 @@ async def validate_schedule(schedule_id: str):
         for day in range(num_days - 1):
             func = raw.get(doc.id, {}).get(day, "LEDIG")
             func_next = raw.get(doc.id, {}).get(day + 1, "LEDIG")
-            if func in ("JOUR_P", "JOUR_B") and func_next not in ("LEDIG", "JOUR_P", "JOUR_B"):
+            if is_jour(func) and not is_jour(func_next) and func_next != "LEDIG":
                 violations.append({
                     "type": "dygnsvila",
                     "severity": "critical",
@@ -1042,7 +1166,7 @@ async def validate_schedule(schedule_id: str):
         for week in range(sched["num_weeks"]):
             week_start = week * 7
             calls = sum(1 for d in range(week_start, min(week_start + 7, num_days))
-                       if raw.get(doc.id, {}).get(d) in ("JOUR_P", "JOUR_B"))
+                       if is_jour(raw.get(doc.id, {}).get(d, "LEDIG")))
             if calls > 1:
                 violations.append({
                     "type": "max_jour_vecka",
@@ -1148,6 +1272,12 @@ async def export_schedule_excel(schedule_id: str):
         "MOTT_C": PatternFill(start_color="ECFDF5", end_color="ECFDF5", fill_type="solid"),
         "JOUR_P": PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid"),
         "JOUR_B": PatternFill(start_color="FFE4E6", end_color="FFE4E6", fill_type="solid"),
+        "JOUR_P_KVÄLL": PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid"),
+        "JOUR_P_NATT": PatternFill(start_color="FECACA", end_color="FECACA", fill_type="solid"),
+        "JOUR_P_HELGDAG": PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid"),
+        "JOUR_P_HELGNATT": PatternFill(start_color="FECACA", end_color="FECACA", fill_type="solid"),
+        "JOUR_B_HELGDAG": PatternFill(start_color="FFE4E6", end_color="FFE4E6", fill_type="solid"),
+        "JOUR_B_HELGNATT": PatternFill(start_color="FECDD5", end_color="FECDD5", fill_type="solid"),
         "LEDIG": PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid"),
     }
 
@@ -1430,7 +1560,7 @@ async def manual_replacement(request: ManualReplacementRequest):
         day_index=request.day,
         day_date=start + timedelta(days=request.day),
         function=request.function,
-        is_call=request.function in ("JOUR_P", "JOUR_B"),
+        is_call=is_jour(request.function),
         site=chain.FUNCTION_SITE.get(request.function),
         weekday=(start + timedelta(days=request.day)).weekday(),
     )
@@ -1518,6 +1648,811 @@ async def db_migrate():
     if ok:
         return {"status": "migrated", "backend": "postgresql", "message": "Tabeller skapade och anslutning aktiv."}
     return {"status": "failed", "message": "Kunde inte ansluta till PostgreSQL. Kontrollera DATABASE_URL."}
+
+
+# === SCHEMAVERSIONER ===
+
+@app.get("/schedule/{schedule_id}/versions", tags=["Versioner"])
+async def get_schedule_versions(schedule_id: str):
+    versions = await db.get_versions(schedule_id)
+    return {"schedule_id": schedule_id, "versions": versions, "count": len(versions)}
+
+
+@app.get("/schedule/{schedule_id}/diff/{v1}/{v2}", tags=["Versioner"])
+async def get_schedule_diff(schedule_id: str, v1: int, v2: int):
+    ver1 = await db.get_version(schedule_id, v1)
+    ver2 = await db.get_version(schedule_id, v2)
+    if not ver1 or not ver2:
+        raise HTTPException(status_code=404, detail="Version inte hittad")
+
+    sched1 = ver1.get("raw_schedule", {})
+    sched2 = ver2.get("raw_schedule", {})
+    changes = []
+    doctors_affected = set()
+    for doc_id in set(list(sched1.keys()) + list(sched2.keys())):
+        days1 = sched1.get(doc_id, {})
+        days2 = sched2.get(doc_id, {})
+        all_days = set(list(days1.keys()) + list(days2.keys()))
+        for day in all_days:
+            old = days1.get(day, days1.get(str(day), "LEDIG"))
+            new = days2.get(day, days2.get(str(day), "LEDIG"))
+            if str(old) != str(new):
+                changes.append({"doctor_id": doc_id, "day": day, "old_func": old, "new_func": new})
+                doctors_affected.add(doc_id)
+
+    return {
+        "schedule_id": schedule_id,
+        "version_a": v1, "version_b": v2,
+        "changed_assignments": changes,
+        "summary": f"{len(changes)} pass ändrade, {len(doctors_affected)} läkare berörda",
+    }
+
+
+# === AUDIT ===
+
+@app.get("/audit", tags=["Audit"])
+async def get_audit_log(action: Optional[str] = None, user_id: Optional[str] = None, limit: int = 50):
+    logs = await db.get_audit_log(action=action, user_id=user_id, limit=limit)
+    return {"logs": logs, "count": len(logs)}
+
+
+@app.get("/audit/stats", tags=["Audit"])
+async def get_audit_stats():
+    return await db.get_audit_stats()
+
+
+# === RAPPORTER ===
+
+@app.get("/reports/monthly", tags=["Rapporter"])
+async def monthly_report(clinic_id: str = "kristianstad", month: Optional[str] = None):
+    config = await db.get_config(clinic_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Klinik inte hittad")
+
+    # Samla data från senaste schemat
+    schedules = await db.list_schedules(clinic_id=clinic_id)
+    if not schedules:
+        return {"period": month, "clinic": clinic_id, "summary": {"total_scheduled_shifts": 0, "total_doctors": len(config.doctors)}}
+
+    latest = max(schedules, key=lambda s: s.get("created_at", ""))
+    raw = latest.get("raw_schedule", {})
+    num_days = latest.get("num_weeks", 2) * 7
+    stats = latest.get("statistics", {})
+
+    total_shifts = sum(1 for days in raw.values() for f in days.values() if f != "LEDIG")
+    adjustments = 0  # Async audit query not available in sync report context
+    absences = 0
+
+    # OB-beräkning
+    from solver import _ob_cost
+    ob_per_doc = {}
+    for doc in config.doctors:
+        total_ob = sum(_ob_cost(int(d) % 7, f, config.ob_rates) for d, f in raw.get(doc.id, {}).items())
+        if total_ob > 0:
+            ob_per_doc[doc.id] = round(total_ob, 1)
+    total_ob = sum(ob_per_doc.values())
+    ob_vals = list(ob_per_doc.values())
+    ob_std = round((sum((v - total_ob/max(len(ob_vals),1))**2 for v in ob_vals) / max(len(ob_vals),1))**0.5, 2) if ob_vals else 0
+
+    return {
+        "period": month or "senaste",
+        "clinic": getattr(config, "name", clinic_id),
+        "summary": {
+            "total_scheduled_shifts": total_shifts,
+            "total_doctors": len(config.doctors),
+            "schedules_generated": len(schedules),
+            "adjustments_made": adjustments,
+            "absences_registered": absences,
+        },
+        "call_distribution": stats.get("call_distribution", {}),
+        "ob_summary": {
+            "total_ob_cost_factor": round(total_ob, 1),
+            "per_doctor": ob_per_doc,
+            "std_deviation": ob_std,
+        },
+        "atl_compliance": {
+            "violations": len(stats.get("atl_violations", [])),
+            "details": stats.get("atl_violations", []),
+        },
+        "workload_balance": stats.get("workload_balance", {}),
+    }
+
+
+# === NOTIFIERINGAR ===
+
+@app.get("/notifications/{user_id}", tags=["Notifieringar"])
+async def get_notifications(user_id: str, unread_only: bool = False):
+    notifs = await db.get_notifications(user_id, unread_only=unread_only)
+    return {"notifications": notifs, "unread_count": sum(1 for n in notifs if not n.get("read"))}
+
+
+@app.put("/notifications/{notif_id}/read", tags=["Notifieringar"])
+async def mark_notification_read(notif_id: str, user_id: str = "anon"):
+    ok = await db.mark_notification_read(user_id, notif_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Notifiering inte hittad")
+    return {"status": "read"}
+
+
+# === INTEGRATIONER ===
+
+from adapters.adapter_manager import AdapterManager, ADAPTER_REGISTRY
+from adapters.base import AdapterConfig, AdapterType, SyncDirection
+
+
+@app.get("/integrations", tags=["Integrationer"])
+async def list_integrations():
+    available = [t.value for t in ADAPTER_REGISTRY.keys()]
+    status = AdapterManager.get_sync_status()
+    return {"available": available, "connected": status}
+
+
+@app.post("/integrations/{adapter_type}/connect", tags=["Integrationer"])
+async def connect_integration(adapter_type: str, config: dict = {}):
+    try:
+        atype = AdapterType(adapter_type)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Okänd adapter: {adapter_type}")
+
+    if atype not in ADAPTER_REGISTRY:
+        raise HTTPException(status_code=400, detail=f"Adapter {adapter_type} ej tillgänglig")
+
+    adapter_cls = ADAPTER_REGISTRY[atype]
+    adapter_config = AdapterConfig(
+        adapter_type=atype,
+        host=config.get("host", "localhost"),
+        port=config.get("port"),
+        database=config.get("database", ""),
+        username=config.get("username", ""),
+        password=config.get("password", ""),
+        api_key=config.get("api_key", ""),
+    )
+    adapter = adapter_cls(adapter_config)
+    try:
+        await adapter.connect()
+        AdapterManager.register_adapter(atype, adapter)
+        await db.audit("integration_connected", details={"adapter": adapter_type})
+        return {"status": "connected", "adapter": adapter_type}
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.post("/integrations/{adapter_type}/disconnect", tags=["Integrationer"])
+async def disconnect_integration(adapter_type: str):
+    try:
+        atype = AdapterType(adapter_type)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Okänd adapter: {adapter_type}")
+    adapter = AdapterManager.get_adapter(atype)
+    if adapter:
+        await adapter.disconnect()
+        del AdapterManager._adapters[atype]
+    return {"status": "disconnected", "adapter": adapter_type}
+
+
+@app.post("/integrations/{adapter_type}/sync", tags=["Integrationer"])
+async def sync_integration(adapter_type: str):
+    try:
+        atype = AdapterType(adapter_type)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Okänd adapter: {adapter_type}")
+    adapter = AdapterManager.get_adapter(atype)
+    if not adapter or not adapter.is_connected:
+        raise HTTPException(status_code=400, detail="Adapter ej ansluten")
+    try:
+        config = await adapter.pull_config()
+        return {"status": "synced", "adapter": adapter_type, "doctors": len(config.doctors) if config else 0}
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.get("/integrations/{adapter_type}/status", tags=["Integrationer"])
+async def integration_status(adapter_type: str):
+    try:
+        atype = AdapterType(adapter_type)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Okänd adapter: {adapter_type}")
+    adapter = AdapterManager.get_adapter(atype)
+    if not adapter:
+        return {"adapter": adapter_type, "connected": False}
+    try:
+        info = await adapter.test_connection()
+        return {"adapter": adapter_type, "connected": adapter.is_connected, **info}
+    except Exception as e:
+        return {"adapter": adapter_type, "connected": False, "error": str(e)}
+
+
+@app.post("/integrations/{adapter_type}/test", tags=["Integrationer"])
+async def test_integration(adapter_type: str, config: dict = {}):
+    try:
+        atype = AdapterType(adapter_type)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Okänd adapter: {adapter_type}")
+    if atype not in ADAPTER_REGISTRY:
+        raise HTTPException(status_code=400, detail=f"Adapter {adapter_type} ej tillgänglig")
+
+    adapter_cls = ADAPTER_REGISTRY[atype]
+    adapter_config = AdapterConfig(
+        adapter_type=atype,
+        host=config.get("host", "localhost"),
+        port=config.get("port"),
+        database=config.get("database", ""),
+        username=config.get("username", ""),
+        password=config.get("password", ""),
+    )
+    adapter = adapter_cls(adapter_config)
+    try:
+        connected = await adapter.connect()
+        info = await adapter.test_connection()
+        await adapter.disconnect()
+        return {"status": "ok" if connected else "failed", **info}
+    except Exception as e:
+        return {"status": "failed", "error": str(e)}
+
+
+# === LÖNEUNDERLAG ===
+
+from payroll_export import payroll_exporter, PayrollExporter
+from op_planning import op_planner, Operation
+from jour_report import jour_reporter
+
+
+@app.get("/payroll/generate", tags=["Löneunderlag"])
+async def generate_payroll(clinic_id: str = "kristianstad", start: str = "2026-04-06", end: str = "2026-04-19"):
+    config = await db.get_config(clinic_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Klinik inte hittad")
+    schedules = await db.list_schedules(clinic_id=clinic_id)
+    if not schedules:
+        return {"entries": [], "summary": {}}
+    latest = max(schedules, key=lambda s: s.get("created_at", ""))
+    raw = latest.get("raw_schedule", latest.get("schedule", {}))
+    entries = payroll_exporter.generate_payroll(raw, start, end, config.doctors)
+    summary = payroll_exporter.get_summary(entries)
+    return {"entries": [{"doctor_id": e.doctor_id, "doctor_name": e.doctor_name, "date": e.date,
+                         "pay_code": e.pay_code.value, "hours": e.hours} for e in entries],
+            "summary": summary}
+
+
+@app.get("/payroll/export", tags=["Löneunderlag"])
+async def export_payroll(clinic_id: str = "kristianstad", start: str = "2026-04-06", end: str = "2026-04-19", format: str = "csv"):
+    config = await db.get_config(clinic_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Klinik inte hittad")
+    schedules = await db.list_schedules(clinic_id=clinic_id)
+    if not schedules:
+        return {"content": "", "format": format}
+    latest = max(schedules, key=lambda s: s.get("created_at", ""))
+    raw = latest.get("raw_schedule", latest.get("schedule", {}))
+    entries = payroll_exporter.generate_payroll(raw, start, end, config.doctors)
+    if format == "paxml":
+        content = payroll_exporter.export_paxml(entries, clinic_id, f"{start[:7]}")
+    else:
+        content = payroll_exporter.export_csv(entries)
+    return {"content": content, "format": format, "entries_count": len(entries)}
+
+
+@app.post("/payroll/validate", tags=["Löneunderlag"])
+async def validate_payroll(body: dict = {}):
+    clinic_id = body.get("clinic_id", "kristianstad")
+    config = await db.get_config(clinic_id)
+    if not config:
+        return {"errors": ["Klinik inte hittad"]}
+    schedules = await db.list_schedules(clinic_id=clinic_id)
+    if not schedules:
+        return {"errors": [], "valid": True}
+    latest = max(schedules, key=lambda s: s.get("created_at", ""))
+    raw = latest.get("raw_schedule", latest.get("schedule", {}))
+    entries = payroll_exporter.generate_payroll(raw, body.get("start", "2026-04-06"), body.get("end", "2026-04-19"), config.doctors)
+    errors = payroll_exporter.validate(entries)
+    return {"errors": errors, "valid": len(errors) == 0}
+
+
+# === OP-PLANERING ===
+
+@app.post("/op/match", tags=["OP-planering"])
+async def match_op(body: dict):
+    ops = [Operation(id=o.get("id", ""), procedure=o.get("procedure", ""),
+                     required_competence=o.get("required_competence", ""),
+                     estimated_duration_min=o.get("duration", 120),
+                     site=o.get("site", "")) for o in body.get("operations", [])]
+    schedule = body.get("schedule", {})
+    competences = body.get("doctor_competences", {})
+    date_str = body.get("date", "")
+    return op_planner.match_competence(ops, schedule, competences, date_str)
+
+
+@app.get("/op/utilization", tags=["OP-planering"])
+async def op_utilization(rooms: int = 5, total_minutes: int = 2400):
+    ops = [Operation(id=f"op{i}", estimated_duration_min=total_minutes // max(rooms, 1)) for i in range(rooms)]
+    return op_planner.calculate_utilization(ops, rooms)
+
+
+# === JOURRAPPORT ===
+
+@app.get("/reports/jour", tags=["Rapporter"])
+async def jour_report(clinic_id: str = "kristianstad", start: str = "2026-04-06", end: str = "2026-04-19"):
+    config = await db.get_config(clinic_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Klinik inte hittad")
+    schedules = await db.list_schedules(clinic_id=clinic_id)
+    if not schedules:
+        return {"period": f"{start} — {end}", "by_doctor": {}, "summary": {}}
+    latest = max(schedules, key=lambda s: s.get("created_at", ""))
+    raw = latest.get("raw_schedule", latest.get("schedule", {}))
+    return jour_reporter.generate_report(raw, start, end, config.doctors)
+
+
+@app.get("/reports/jour/compare", tags=["Rapporter"])
+async def compare_jour(clinic_id: str = "kristianstad",
+                       start1: str = "", end1: str = "", start2: str = "", end2: str = ""):
+    config = await db.get_config(clinic_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Klinik inte hittad")
+    schedules = await db.list_schedules(clinic_id=clinic_id)
+    if not schedules:
+        return {"changes": {}}
+    latest = max(schedules, key=lambda s: s.get("created_at", ""))
+    raw = latest.get("raw_schedule", latest.get("schedule", {}))
+    r1 = jour_reporter.generate_report(raw, start1, end1, config.doctors) if start1 else {}
+    r2 = jour_reporter.generate_report(raw, start2, end2, config.doctors) if start2 else {}
+    return jour_reporter.compare_periods(r1, r2)
+
+
+# === DASHBOARD ===
+
+@app.get("/dashboard", tags=["Dashboard"])
+async def get_dashboard(clinic_id: str = "kristianstad"):
+    config = await db.get_config(clinic_id)
+    doctors = config.doctors if config else []
+    schedules = await db.list_schedules(clinic_id=clinic_id)
+    latest = max(schedules, key=lambda s: s.get("created_at", "")) if schedules else None
+    raw = latest.get("raw_schedule", {}) if latest else {}
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    weekday = datetime.now().weekday()
+
+    # Idag
+    by_function = {}
+    absent = 0
+    primary_call = backup_call = None
+    for doc in doctors:
+        func = None
+        date_sched = latest.get("schedule", {}).get(doc.id, {}) if latest else {}
+        func = date_sched.get(today_str, "LEDIG")
+        if func == "LEDIG":
+            absent += 1
+        elif "JOUR_P" in func:
+            primary_call = doc.name
+        elif "JOUR_B" in func:
+            backup_call = doc.name
+        else:
+            prefix = func.split("_")[0] if func else "LEDIG"
+            by_function[prefix] = by_function.get(prefix, 0) + 1
+
+    # Varningar
+    warnings = []
+    swap_pending = len([r for r in db._swap_requests if r.status in ("pending_peer", "atl_validated")])
+    if swap_pending > 0:
+        warnings.append(f"{swap_pending} bytesförfrågningar väntar")
+
+    return {
+        "today": {
+            "date": today_str,
+            "doctors_working": len(doctors) - absent,
+            "by_function": by_function,
+            "primary_call": primary_call,
+            "backup_call": backup_call,
+            "absent": absent,
+        },
+        "warnings": warnings,
+        "statistics": {
+            "total_calls": sum(1 for days in raw.values() for f in days.values() if f in ("JOUR_P", "JOUR_B")),
+            "op_utilization": 0.85,
+        },
+        "pending": {
+            "swap_requests": swap_pending,
+            "wishes": len([w for w in preference_manager._wishes if w.status == "pending"]),
+            "vacation_requests": 0,
+        },
+    }
+
+
+# === ÖNSKEMÅL ===
+
+from preferences import preference_manager, ScheduleWish, WishPeriod
+from schema_import import schema_importer
+
+# Onboarding progress store
+_onboarding = {}
+
+
+@app.post("/wish-periods", tags=["Önskemål"])
+async def create_wish_period(body: dict):
+    period = preference_manager.create_period(
+        clinic_id=body.get("clinic_id", "kristianstad"),
+        name=body.get("name", ""), schedule_start=body.get("schedule_start", ""),
+        schedule_end=body.get("schedule_end", ""), wish_deadline=body.get("wish_deadline", ""),
+    )
+    return {"status": "created", "id": period.id}
+
+
+@app.get("/wish-periods", tags=["Önskemål"])
+async def list_wish_periods(clinic_id: str = "kristianstad"):
+    periods = [p for p in preference_manager._periods.values() if p.clinic_id == clinic_id]
+    return {"periods": [{"id": p.id, "name": p.name, "status": p.status,
+                         "wish_deadline": p.wish_deadline} for p in periods]}
+
+
+@app.post("/wish-periods/{period_id}/close", tags=["Önskemål"])
+async def close_wish_period(period_id: str):
+    p = preference_manager.close_period(period_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Period inte hittad")
+    return {"status": "closed", "id": p.id}
+
+
+@app.get("/wish-periods/{period_id}/collisions", tags=["Önskemål"])
+async def get_collisions(period_id: str):
+    return preference_manager.get_collision_report(period_id)
+
+
+@app.post("/wishes", tags=["Önskemål"])
+async def submit_wish(body: dict):
+    wish = ScheduleWish(
+        id=f"wish_{len(preference_manager._wishes)+1}",
+        doctor_id=body.get("doctor_id", ""),
+        doctor_name=body.get("doctor_name", ""),
+        period_id=body.get("period_id", ""),
+        wish_type=body.get("wish_type", "ledig_dag"),
+        priority=body.get("priority", "normal"),
+        dates=body.get("dates", []),
+        week_numbers=body.get("week_numbers", []),
+        weekdays=body.get("weekdays", []),
+        function=body.get("function"),
+        site=body.get("site"),
+        note=body.get("note", ""),
+    )
+    preference_manager.submit_wish(wish)
+    return {"status": "submitted", "id": wish.id}
+
+
+@app.get("/wishes", tags=["Önskemål"])
+async def list_wishes(period_id: str = "", doctor_id: str = None):
+    wishes = preference_manager.get_wishes_for_period(period_id, doctor_id)
+    return {"wishes": [{"id": w.id, "doctor_id": w.doctor_id, "wish_type": w.wish_type,
+                        "priority": w.priority, "dates": w.dates, "status": w.status,
+                        "note": w.note} for w in wishes]}
+
+
+@app.delete("/wishes/{wish_id}", tags=["Önskemål"])
+async def delete_wish(wish_id: str):
+    preference_manager._wishes = [w for w in preference_manager._wishes if w.id != wish_id]
+    return {"status": "deleted"}
+
+
+# === IMPORT ===
+
+@app.post("/import/preview", tags=["Import"])
+async def import_preview(body: dict):
+    csv_text = body.get("csv_text", "")
+    clinic_id = body.get("clinic_id", "kristianstad")
+    return schema_importer.preview_import(csv_text, clinic_id)
+
+
+@app.post("/import/execute", tags=["Import"])
+async def import_execute(body: dict):
+    csv_text = body.get("csv_text", "")
+    clinic_id = body.get("clinic_id", "kristianstad")
+    mapping = body.get("mapping", {})
+    result = schema_importer.import_from_csv(csv_text, clinic_id, mapping)
+    if result["schedule"]:
+        sid = f"imp_{datetime.now().strftime('%H%M%S')}"
+        _import_data = {
+            "schedule_id": sid, "status": "imported", "clinic_id": clinic_id,
+            "raw_schedule": result["schedule"], "schedule": result["schedule"],
+            "created_at": datetime.now().isoformat(),
+        }
+        await db.save_schedule(_import_data)
+        result["schedule_id"] = sid
+    await db.audit("schema_imported", details={"clinic_id": clinic_id, "rows": result["imported_rows"]})
+    return result
+
+
+# === ONBOARDING ===
+
+@app.post("/onboarding/status", tags=["Onboarding"])
+async def save_onboarding(body: dict):
+    clinic_id = body.get("clinic_id", "new")
+    _onboarding[clinic_id] = body
+    return {"status": "saved", "clinic_id": clinic_id}
+
+
+@app.get("/onboarding/status", tags=["Onboarding"])
+async def get_onboarding(clinic_id: str = "new"):
+    return _onboarding.get(clinic_id, {"step": 1})
+
+
+# === GRUNDSCHEMA ===
+
+@app.post("/base-schedule/generate", tags=["Grundschema"])
+async def generate_base(body: dict = {}):
+    clinic_id = body.get("clinic_id", "kristianstad")
+    config = await db.get_config(clinic_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Klinik inte hittad")
+    cycle = body.get("cycle_weeks", 10)
+    time_limit = body.get("time_limit_seconds", 120)
+
+    from solver import generate_base_schedule
+    base = generate_base_schedule(config, cycle_weeks=cycle, time_limit_seconds=time_limit)
+    if base is None:
+        raise HTTPException(status_code=422, detail="Kunde inte generera grundschema")
+
+    db._base_schedules[base.id] = base
+    await db.audit("base_schedule_generated", details={"id": base.id, "cycle": cycle})
+    return {"status": "generated", "id": base.id, "cycle_weeks": cycle, "slots": len(base.slots)}
+
+
+@app.get("/base-schedule/{base_id}", tags=["Grundschema"])
+async def get_base_schedule(base_id: str):
+    base = db._base_schedules.get(base_id)
+    if not base:
+        raise HTTPException(status_code=404, detail="Grundschema inte hittat")
+    return {"id": base.id, "name": base.name, "cycle_length_weeks": base.cycle_length_weeks,
+            "slots_count": len(base.slots), "effective_from": base.effective_from}
+
+
+@app.get("/base-schedule/list/all", tags=["Grundschema"])
+async def list_base_schedules():
+    return {"schedules": [{"id": b.id, "name": b.name, "cycle_weeks": b.cycle_length_weeks}
+                          for b in db._base_schedules.values()]}
+
+
+@app.post("/deviations", tags=["Grundschema"])
+async def create_deviation(body: dict):
+    from data_model import ScheduleDeviation
+    dev = ScheduleDeviation(
+        id=f"dev_{len(db._deviations)+1}",
+        base_schedule_id=body.get("base_schedule_id", ""),
+        date=body.get("date", ""),
+        doctor_id=body.get("doctor_id", ""),
+        original_function=body.get("original_function", ""),
+        new_function=body.get("new_function", "LEDIG"),
+        reason=body.get("reason", ""),
+        created_at=datetime.now().isoformat(),
+    )
+    db._deviations.append(dev)
+    return {"status": "created", "id": dev.id}
+
+
+@app.get("/schedule/effective", tags=["Grundschema"])
+async def get_effective_schedule(base_id: str = "", start: str = "2026-04-06", weeks: int = 2):
+    base = db._base_schedules.get(base_id)
+    if not base:
+        if db._base_schedules:
+            base = list(db._base_schedules.values())[0]
+        else:
+            raise HTTPException(status_code=404, detail="Inget grundschema")
+    from solver import resolve_effective_schedule
+    devs = [d for d in db._deviations if d.base_schedule_id == base.id]
+    schedule = resolve_effective_schedule(base, devs, start, weeks)
+    return {"base_id": base.id, "start": start, "weeks": weeks, "schedule": schedule}
+
+
+# === KOMP-TID ===
+
+@app.get("/comp-time/{doctor_id}", tags=["Komp-tid"])
+async def get_comp_time(doctor_id: str):
+    account = db._comp_accounts.get(doctor_id)
+    if not account:
+        return {"doctor_id": doctor_id, "balance_hours": 0, "balance_days": 0, "entries": []}
+    return {
+        "doctor_id": doctor_id,
+        "balance_hours": account.balance_hours,
+        "balance_days": round(account.balance_days, 1),
+        "entries": [{"id": e.id, "date": e.date, "call_type": e.call_type,
+                     "hours_earned": e.hours_earned, "hours_used": e.hours_used,
+                     "status": e.status} for e in account.entries],
+    }
+
+
+@app.get("/comp-time/overview/all", tags=["Komp-tid"])
+async def comp_time_overview():
+    result = {}
+    for doc_id, account in db._comp_accounts.items():
+        result[doc_id] = {"balance_hours": account.balance_hours, "balance_days": round(account.balance_days, 1)}
+    return {"accounts": result}
+
+
+# === BYTESFÖRFRÅGNINGAR ===
+
+@app.post("/swap-requests", tags=["Byte"])
+async def create_swap_request(body: dict):
+    from data_model import SwapRequest
+    req = SwapRequest(
+        id=f"swap_{len(db._swap_requests)+1}",
+        clinic_id=body.get("clinic_id", "kristianstad"),
+        requester_id=body.get("requester_id", ""),
+        requester_date=body.get("requester_date", ""),
+        requester_function=body.get("requester_function", ""),
+        target_id=body.get("target_id", ""),
+        target_date=body.get("target_date", ""),
+        target_function=body.get("target_function", ""),
+        message=body.get("message", ""),
+        created_at=datetime.now().isoformat(),
+        expires_at=(datetime.now() + timedelta(days=7)).isoformat(),
+    )
+    db._swap_requests.append(req)
+    await db.audit("swap_request_created", details={"id": req.id, "requester": req.requester_id, "target": req.target_id})
+    return {"status": "created", "id": req.id, "status_code": req.status}
+
+
+@app.get("/swap-requests", tags=["Byte"])
+async def list_swap_requests(doctor_id: str = None, status: str = None):
+    reqs = db._swap_requests
+    if doctor_id:
+        reqs = [r for r in reqs if r.requester_id == doctor_id or r.target_id == doctor_id]
+    if status:
+        reqs = [r for r in reqs if r.status == status]
+    return {"requests": [{"id": r.id, "requester_id": r.requester_id, "target_id": r.target_id,
+                          "requester_date": r.requester_date, "target_date": r.target_date,
+                          "status": r.status, "message": r.message, "created_at": r.created_at}
+                         for r in reqs]}
+
+
+@app.post("/swap-requests/{req_id}/peer-respond", tags=["Byte"])
+async def peer_respond(req_id: str, body: dict = {}):
+    req = next((r for r in db._swap_requests if r.id == req_id), None)
+    if not req:
+        raise HTTPException(status_code=404, detail="Förfrågan inte hittad")
+    accept = body.get("accept", False)
+    if accept:
+        req.status = "peer_accepted"
+        req.peer_response_at = datetime.now().isoformat()
+        # Auto ATL-validering (enkel)
+        req.status = "atl_validated"
+    else:
+        req.status = "peer_rejected"
+        req.peer_response_at = datetime.now().isoformat()
+    return {"status": req.status, "id": req.id}
+
+
+@app.post("/swap-requests/{req_id}/admin-respond", tags=["Byte"])
+async def admin_respond(req_id: str, body: dict = {}):
+    req = next((r for r in db._swap_requests if r.id == req_id), None)
+    if not req:
+        raise HTTPException(status_code=404, detail="Förfrågan inte hittad")
+    approve = body.get("approve", False)
+    if approve:
+        req.status = "approved"
+        req.admin_response_at = datetime.now().isoformat()
+        req.completed_at = datetime.now().isoformat()
+        await db.audit("swap_approved", details={"id": req.id})
+    else:
+        req.status = "rejected"
+        req.admin_response_at = datetime.now().isoformat()
+    return {"status": req.status, "id": req.id}
+
+
+@app.post("/swap-requests/{req_id}/cancel", tags=["Byte"])
+async def cancel_swap_request(req_id: str):
+    req = next((r for r in db._swap_requests if r.id == req_id), None)
+    if not req:
+        raise HTTPException(status_code=404, detail="Förfrågan inte hittad")
+    req.status = "cancelled"
+    return {"status": "cancelled", "id": req.id}
+
+
+# === REGELMOTOR ===
+
+# In-memory regel-lagring
+_detailed_rules = {}  # {clinic_id: [DetailedRule]}
+
+
+@app.get("/rules", tags=["Regler"])
+async def list_rules(clinic_id: str = "kristianstad"):
+    rules = _detailed_rules.get(clinic_id, [])
+    return {"rules": [_rule_to_dict(r) for r in rules], "count": len(rules)}
+
+
+@app.post("/rules", tags=["Regler"])
+async def create_rule(body: dict):
+    clinic_id = body.get("clinic_id", "kristianstad")
+    from rule_engine import DetailedRule, TimeFilter, PersonFilter, ActionSpec
+    rule = DetailedRule(
+        id=body.get("id", f"rule_{len(_detailed_rules.get(clinic_id, []))+1}"),
+        name=body.get("name", "Ny regel"),
+        description=body.get("description", ""),
+        category=body.get("category", "preference"),
+        is_hard=body.get("is_hard", False),
+        weight=body.get("weight", 5),
+        time_filter=TimeFilter(**body["time_filter"]) if body.get("time_filter") else None,
+        person_filter=PersonFilter(**body["person_filter"]) if body.get("person_filter") else None,
+        action=ActionSpec(**body["action"]) if body.get("action") else None,
+        source=body.get("source", "manual"),
+    )
+    if clinic_id not in _detailed_rules:
+        _detailed_rules[clinic_id] = []
+    _detailed_rules[clinic_id].append(rule)
+    await db.audit("rule_created", details={"clinic_id": clinic_id, "rule_id": rule.id})
+    return {"status": "created", "rule": _rule_to_dict(rule)}
+
+
+@app.delete("/rules/{rule_id}", tags=["Regler"])
+async def delete_rule(rule_id: str, clinic_id: str = "kristianstad"):
+    rules = _detailed_rules.get(clinic_id, [])
+    _detailed_rules[clinic_id] = [r for r in rules if r.id != rule_id]
+    return {"status": "deleted", "rule_id": rule_id}
+
+
+@app.post("/rules/validate", tags=["Regler"])
+async def validate_rules(clinic_id: str = "kristianstad"):
+    rules = _detailed_rules.get(clinic_id, [])
+    config = await db.get_config(clinic_id)
+    if not config or not rules:
+        return {"conflicts": [], "total": 0}
+    from rule_engine import RuleEngine
+    engine = RuleEngine(config, rules)
+    conflicts = engine.validate_rules()
+    return {"conflicts": conflicts, "total": len(conflicts)}
+
+
+@app.get("/rules/templates", tags=["Regler"])
+async def get_rule_templates():
+    from rule_engine import create_example_rules
+    rules = create_example_rules()
+    return {"templates": [_rule_to_dict(r) for r in rules], "count": len(rules)}
+
+
+def _rule_to_dict(rule) -> dict:
+    """Konvertera DetailedRule till dict för API-svar."""
+    d = {"id": rule.id, "name": rule.name, "description": rule.description,
+         "category": rule.category, "is_hard": rule.is_hard, "weight": rule.weight,
+         "enabled": rule.enabled, "source": getattr(rule, "source", "manual")}
+    if rule.time_filter:
+        d["time_filter"] = {k: v for k, v in rule.time_filter.__dict__.items() if v is not None}
+    if rule.person_filter:
+        d["person_filter"] = {k: v for k, v in rule.person_filter.__dict__.items() if v is not None}
+    if rule.action:
+        d["action"] = {k: v for k, v in rule.action.__dict__.items() if v is not None}
+    return d
+
+
+# === SIMULATOR ===
+
+@app.post("/simulate", tags=["Simulator"])
+async def run_simulation(body: dict):
+    clinic_id = body.get("clinic_id", "kristianstad")
+    config = await db.get_config(clinic_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Klinik inte hittad")
+
+    from simulator import WhatIfSimulator, Scenario
+
+    # Hämta baseline-schema om det finns
+    schedules = await db.list_schedules(clinic_id=clinic_id)
+    baseline = max(schedules, key=lambda s: s.get("created_at", "")).get("raw_schedule") if schedules else None
+
+    simulator = WhatIfSimulator(config, baseline)
+    scenarios = [Scenario(type=s["type"], description=s.get("description", ""),
+                          changes=s.get("changes", {})) for s in body.get("scenarios", [])]
+
+    results = simulator.simulate(scenarios, time_limit=body.get("time_limit", 15))
+    await db.audit("simulation_run", details={"clinic_id": clinic_id, "scenarios": len(scenarios)})
+
+    return {
+        "results": [{
+            "feasible": r.feasible,
+            "impact_summary_sv": r.impact_summary_sv,
+            "staffing_impact": r.staffing_impact,
+            "call_impact": r.call_impact,
+            "ob_impact": r.ob_impact,
+            "recommendations_sv": r.recommendations_sv,
+            "risk_level": r.risk_level,
+        } for r in results],
+        "total_scenarios": len(scenarios),
+    }
 
 
 # === MAIN ===

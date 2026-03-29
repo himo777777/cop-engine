@@ -5,38 +5,47 @@ Claude API wrapper med caching, rate limiting och felhantering.
 """
 
 import os
+import re
 import time
 import json
 import hashlib
 import logging
+import threading
 from typing import Optional
 
 logger = logging.getLogger("cop.ai")
 
 ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
 _client = None
-_cache: dict[str, tuple[float, dict]] = {}  # key → (timestamp, result)
-_rate_counters: dict[str, list[float]] = {}  # clinic_id → [timestamps]
+_cache: dict[str, tuple[float, dict]] = {}
+_cache_lock = threading.Lock()
+_rate_counters: dict[str, list[float]] = {}
 
 CACHE_TTL = 300  # 5 minutes
 RATE_LIMIT = 10  # per minute per clinic
 RATE_WINDOW = 60  # seconds
+MAX_RETRIES = 3
+RETRY_DELAYS = [1, 2, 4]  # seconds
+
+
+class ConfigError(Exception):
+    """Raised when required configuration (e.g. API key) is missing."""
+    pass
 
 
 def get_client():
-    """Hämta Anthropic-klient (lazy init)."""
+    """Hämta Anthropic-klient (lazy init). Kastar ConfigError om API-nyckel saknas."""
     global _client
     if _client is None:
         try:
             import anthropic
             api_key = os.environ.get("ANTHROPIC_API_KEY", "")
             if not api_key:
-                logger.warning("ANTHROPIC_API_KEY not set")
-                return None
+                raise ConfigError("ANTHROPIC_API_KEY saknas — sätt miljövariabeln innan start")
             _client = anthropic.Anthropic(api_key=api_key)
         except ImportError:
-            logger.error("anthropic package not installed")
-            return None
+            logger.error("anthropic-paketet är inte installerat")
+            raise ConfigError("anthropic-paketet saknas — kör: pip install anthropic")
     return _client
 
 
@@ -59,11 +68,51 @@ def _cache_key(system: str, messages: list, tools: list = None) -> str:
 
 
 def _get_cached(key: str) -> Optional[dict]:
-    if key in _cache:
-        ts, result = _cache[key]
-        if time.time() - ts < CACHE_TTL:
-            return result
-        del _cache[key]
+    with _cache_lock:
+        if key in _cache:
+            ts, result = _cache[key]
+            if time.time() - ts < CACHE_TTL:
+                return result
+            del _cache[key]
+    return None
+
+
+def _set_cached(key: str, result: dict):
+    with _cache_lock:
+        _cache[key] = (time.time(), result)
+
+
+def _extract_json(text: str) -> Optional[dict]:
+    """
+    Försöker extrahera ett JSON-objekt ur text på tre sätt:
+    1. Direkt parsning
+    2. find/rfind (hanterar text runt JSON)
+    3. Regex (hanterar inbäddad JSON i längre text)
+    Returnerar None om alla försök misslyckas.
+    """
+    # Försök 1: direkt parsning
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Försök 2: find/rfind
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start:end])
+        except Exception:
+            pass
+
+    # Försök 3: regex (hanterar kod-block-inbäddad JSON)
+    m = re.search(r'\{.*\}', text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group())
+        except Exception:
+            pass
+
     return None
 
 
@@ -75,7 +124,7 @@ async def call_claude(
     max_tokens: int = 2000,
 ) -> dict:
     """
-    Anropa Claude med caching och rate limiting.
+    Anropa Claude med caching, rate limiting och retry.
 
     Returns:
         {"text": str, "tool_calls": list, "usage": dict} eller {"error": str}
@@ -88,44 +137,83 @@ async def call_claude(
     cache_key = _cache_key(system, messages, tools)
     cached = _get_cached(cache_key)
     if cached:
+        logger.debug("cache_hit", extra={"clinic_id": clinic_id, "key": cache_key[:8]})
         return cached
 
-    client = get_client()
-    if not client:
-        return {"error": "AI ej tillgänglig (API-nyckel saknas)", "text": "", "tool_calls": []}
-
     try:
-        _record_call(clinic_id)
+        client = get_client()
+    except ConfigError as e:
+        logger.error(f"Konfigurationsfel: {e}")
+        return {"error": f"AI ej tillgänglig ({e})", "text": "", "tool_calls": []}
 
-        kwargs = {
-            "model": ANTHROPIC_MODEL,
-            "max_tokens": max_tokens,
-            "system": system,
-            "messages": messages,
-        }
-        if tools:
-            kwargs["tools"] = tools
+    kwargs = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": messages,
+    }
+    if tools:
+        kwargs["tools"] = tools
 
-        response = client.messages.create(**kwargs)
+    _record_call(clinic_id)
+    t_start = time.time()
 
-        text = ""
-        tool_calls = []
-        for block in response.content:
-            if block.type == "text":
-                text += block.text
-            elif block.type == "tool_use":
-                tool_calls.append({"id": block.id, "name": block.name, "input": block.input})
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            import anthropic as _anthropic
+            response = client.messages.create(**kwargs)
 
-        result = {
-            "text": text,
-            "tool_calls": tool_calls,
-            "usage": {"input": response.usage.input_tokens, "output": response.usage.output_tokens},
-        }
+            text = ""
+            tool_calls = []
+            for block in response.content:
+                if block.type == "text":
+                    text += block.text
+                elif block.type == "tool_use":
+                    tool_calls.append({"id": block.id, "name": block.name, "input": block.input})
 
-        # Cache result
-        _cache[cache_key] = (time.time(), result)
-        return result
+            result = {
+                "text": text,
+                "tool_calls": tool_calls,
+                "usage": {
+                    "input": response.usage.input_tokens,
+                    "output": response.usage.output_tokens,
+                },
+            }
 
-    except Exception as e:
-        logger.error(f"Claude API error: {e}")
-        return {"error": f"AI-fel: {str(e)}", "text": "", "tool_calls": []}
+            logger.info(
+                "claude_call",
+                extra={
+                    "clinic_id": clinic_id,
+                    "input_tokens": response.usage.input_tokens,
+                    "output_tokens": response.usage.output_tokens,
+                    "latency_ms": int((time.time() - t_start) * 1000),
+                    "cached": False,
+                },
+            )
+
+            _set_cached(cache_key, result)
+            return result
+
+        except Exception as e:
+            # Klassificera: retry bara på transienta fel
+            retryable = False
+            try:
+                import anthropic as _anthropic
+                retryable = isinstance(
+                    e,
+                    (_anthropic.RateLimitError, _anthropic.APIConnectionError, _anthropic.InternalServerError),
+                )
+            except ImportError:
+                pass
+
+            last_error = e
+            if retryable and attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAYS[attempt]
+                logger.warning(f"Retry {attempt + 1}/{MAX_RETRIES} efter {delay}s: {e}")
+                time.sleep(delay)
+            else:
+                break
+
+    logger.error(f"Claude API-fel efter {MAX_RETRIES} försök: {last_error}")
+    return {"error": f"AI-fel: {str(last_error)}", "text": "", "tool_calls": []}

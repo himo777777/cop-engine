@@ -6,7 +6,7 @@ Chattgränssnitt där personal kan ställa frågor och göra ändringar.
 
 import json
 from data_model import ClinicConfig
-from ai_base import call_claude
+from ai_base import call_claude, _extract_json
 
 SYSTEM_PROMPT = """Du är COP-assistenten — ett chattgränssnitt för klinisk schemaläggning.
 
@@ -61,19 +61,17 @@ Klinik: {len(config.doctors)} läkare, sites: {config.sites}"""
 
     if result.get("error"):
         return {
-            "response_sv": "Tyvärr kunde jag inte svara just nu. Försök igen.",
-            "intent": "other", "action": None, "suggestions": [], "error": result["error"],
+            "response_sv": "AI-assistenten är tillfälligt otillgänglig. Kontakta schemaadministratören.",
+            "intent": "other", "action": None, "suggestions": [],
+            "error": result["error"], "fallback": True,
         }
 
-    try:
-        text = result["text"]
-        json_start = text.find("{")
-        json_end = text.rfind("}") + 1
-        parsed = json.loads(text[json_start:json_end])
+    parsed = _extract_json(result["text"])
+    if parsed is not None:
         parsed["error"] = None
         return parsed
-    except Exception:
-        return {
-            "response_sv": result.get("text", "Kunde inte tolka svaret"),
-            "intent": "other", "action": None, "suggestions": [], "error": None,
-        }
+
+    return {
+        "response_sv": result.get("text", "Kunde inte tolka svaret"),
+        "intent": "other", "action": None, "suggestions": [], "error": None,
+    }

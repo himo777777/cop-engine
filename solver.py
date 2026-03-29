@@ -18,13 +18,14 @@ Mjuka constraints (optimeras):
 """
 
 import json
+import math
 import sys
 from collections import defaultdict
 from ortools.sat.python import cp_model
 
 from data_model import (
     ClinicConfig, Role, ShiftType, Function, ConstraintRule,
-    create_kristianstad_example,
+    create_kristianstad_example, is_jour, OBRates,
 )
 
 
@@ -35,6 +36,12 @@ FUNC_NAMES = {
     Function.AKUTMOTTAGNING: "Akut",
     Function.PRIMÄRJOUR: "Primärjour",
     Function.BAKJOUR: "Bakjour",
+    Function.JOUR_P_KVÄLL: "PJ Kväll",
+    Function.JOUR_P_NATT: "PJ Natt",
+    Function.JOUR_P_HELGDAG: "PJ Helgdag",
+    Function.JOUR_P_HELGNATT: "PJ Helgnatt",
+    Function.JOUR_B_HELGDAG: "BJ Helgdag",
+    Function.JOUR_B_HELGNATT: "BJ Helgnatt",
     Function.ADMIN: "Admin",
     Function.LEDIG: "Ledig",
     Function.SEMESTER: "Semester",
@@ -58,6 +65,25 @@ def _rule_weight(config: ClinicConfig, rule_id: str, default: int = 5) -> int:
         return 0
     # Skala vikt: config weight 1-10 → solver multiplier
     return weight * 2  # weight 5 → 10, weight 10 → 20
+
+
+def _ob_cost(weekday: int, func_id: str, ob_rates: OBRates) -> float:
+    """Beräkna OB-kostnad för en tilldelning baserat på veckodag och skift."""
+    if func_id == "JOUR_P":
+        if weekday < 5:  # Vardag kväll+natt
+            return ob_rates.weekday_evening + ob_rates.weekday_night
+        elif weekday == 5:  # Lördag dag
+            return ob_rates.saturday_day
+        else:  # Söndag dag
+            return ob_rates.sunday_day
+    elif func_id == "JOUR_B":
+        if weekday < 5:
+            return ob_rates.weekday_evening + ob_rates.weekday_night
+        elif weekday == 5:
+            return ob_rates.saturday_day
+        else:
+            return ob_rates.sunday_day
+    return 0.0
 
 
 def _build_functions(config: ClinicConfig):
@@ -93,7 +119,8 @@ def _build_functions(config: ClinicConfig):
     return day_functions, call_functions, op_funcs_by_site
 
 
-def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds: int = 30):
+def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds: int = 30,
+                   locked_assignments: dict = None):
     """
     Genererar ett optimerat schema för given klinik.
 
@@ -101,6 +128,7 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
         config: Komplett klinikkonfiguration
         num_weeks: Antal veckor att schemalägga
         time_limit_seconds: Maximal lösartid
+        locked_assignments: Låsta tilldelningar {doc_id: {day_index: func_id}}
 
     Returns:
         dict med schemat, eller None om olösbart
@@ -126,6 +154,14 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
             for func_id, func, site in call_functions:
                 x[(doc.id, day, func_id)] = model.new_bool_var(f"x_{doc.id}_{day}_{func_id}")
             x[(doc.id, day, "LEDIG")] = model.new_bool_var(f"x_{doc.id}_{day}_LEDIG")
+
+    # === LÅSTA TILLDELNINGAR (rullande schema) ===
+    if locked_assignments:
+        for doc_id, day_funcs in locked_assignments.items():
+            for day_key, func_id in day_funcs.items():
+                day = int(day_key)
+                if (doc_id, day, func_id) in x:
+                    model.add(x[(doc_id, day, func_id)] == 1)
 
     # === CONSTRAINT 1: Varje läkare gör exakt EN sak per dag ===
     for doc in config.doctors:
@@ -187,6 +223,33 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
                 for func_id, func, site in day_functions:
                     if func == Function.MOTTAGNING:
                         model.add(x[(doc.id, day, func_id)] == 0)
+
+    # === CONSTRAINT X: Kompetensmatchning ===
+    # För varje ShiftDefinition med required_competencies: minst en kvalificerad läkare måste vara tilldelad.
+    _FUNC_TO_ID = {
+        Function.OPERATION:     lambda s: f"OP_{s.site}",
+        Function.AVDELNING:     lambda s: f"AVD_{s.site}",
+        Function.MOTTAGNING:    lambda s: f"MOTT_{s.site}",
+        Function.PRIMÄRJOUR:    lambda _: "JOUR_P",
+        Function.BAKJOUR:       lambda _: "JOUR_B",
+    }
+    for shift_def in getattr(config, "shift_definitions", []):
+        if not getattr(shift_def, "required_competencies", None):
+            continue
+        fn = _FUNC_TO_ID.get(shift_def.function)
+        if fn is None:
+            continue
+        func_id = fn(shift_def)
+        qualified = [
+            d for d in config.doctors
+            if all(c in (d.competencies or []) for c in shift_def.required_competencies)
+        ]
+        if not qualified:
+            continue
+        for day in range(num_days):
+            keys = [(d.id, day, func_id) for d in qualified if (d.id, day, func_id) in x]
+            if keys:
+                model.add(sum(x[k] for k in keys) >= 1)
 
     # === CONSTRAINT 3: Jourlinjer (alla dagar) ===
     primary_eligible = [d for d in config.doctors if d.can_primary_call]
@@ -302,6 +365,117 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
                     active_ol.append(1 - x[(d.id, day, "LEDIG")])
         if active_ol:
             model.add(sum(active_ol) >= 1)
+
+    # === CONSTRAINT 12: Helgkompensation ===
+    # Primärjour helg → 1 ledig vardag veckan efter (hård)
+    # Bakjour helg → 1 ledig vardag veckan efter (mjuk penalty)
+    weekend_comp_penalties = []
+
+    for doc in config.doctors:
+        for week in range(num_weeks - 1):  # Sista veckan har ingen "veckan efter"
+            sat = week * 7 + 5
+            sun = week * 7 + 6
+            next_week_start = (week + 1) * 7
+            next_week_weekdays = [d for d in range(next_week_start, min(next_week_start + 5, num_days))]
+
+            if not next_week_weekdays:
+                continue
+
+            for call_type in ["JOUR_P", "JOUR_B"]:
+                is_primary = (call_type == "JOUR_P")
+                weekend_calls = []
+                for d in [sat, sun]:
+                    if d < num_days and (doc.id, d, call_type) in x:
+                        weekend_calls.append(x[(doc.id, d, call_type)])
+
+                if not weekend_calls:
+                    continue
+
+                num_weekend_calls = model.new_int_var(0, 2, f"wc_{doc.id}_{week}_{call_type}")
+                model.add(num_weekend_calls == sum(weekend_calls))
+
+                next_week_ledig = []
+                for d in next_week_weekdays:
+                    if (doc.id, d, "LEDIG") in x:
+                        next_week_ledig.append(x[(doc.id, d, "LEDIG")])
+
+                if not next_week_ledig:
+                    continue
+
+                num_ledig = model.new_int_var(0, 5, f"wl_{doc.id}_{week}_{call_type}")
+                model.add(num_ledig == sum(next_week_ledig))
+
+                if is_primary and config.call_structure.weekend_comp_primary:
+                    # HÅRD: lediga vardagar >= helgjourdagar
+                    model.add(num_ledig >= num_weekend_calls)
+                elif not is_primary and config.call_structure.weekend_comp_backup:
+                    # MJUK: penalty om inte tillräckligt ledigt
+                    shortfall = model.new_int_var(0, 2, f"ws_{doc.id}_{week}")
+                    model.add(shortfall >= num_weekend_calls - num_ledig)
+                    model.add(shortfall >= 0)
+                    weekend_comp_penalties.append(shortfall)
+
+    # === CONSTRAINT 13: Semesterblock ===
+    locked_set = set()
+    if locked_assignments:
+        for doc_id, day_funcs in locked_assignments.items():
+            for day_key in day_funcs:
+                locked_set.add((doc_id, int(day_key)))
+
+    semester_bonus = []
+    for pref in config.preferences:
+        if pref.type != "SEMESTER_BLOCK":
+            continue
+        doc = doc_by_id.get(pref.doctor_id)
+        if not doc:
+            continue
+
+        sw = pref.details.get("start_week", 0)
+        ew = pref.details.get("end_week", sw)
+
+        for week in range(sw, min(ew + 1, num_weeks)):
+            for d in range(week * 7, min((week + 1) * 7, num_days)):
+                if (doc.id, d) in locked_set:
+                    continue  # Skippa låsta dagar
+                if (doc.id, d, "LEDIG") not in x:
+                    continue
+                if pref.priority == 1:
+                    model.add(x[(doc.id, d, "LEDIG")] == 1)
+                else:
+                    semester_bonus.append(x[(doc.id, d, "LEDIG")])
+
+    # === CONSTRAINT 14: Max samtidiga semestrar ===
+    max_vac = config.max_concurrent_vacation
+    if max_vac == 0:
+        max_vac = math.ceil(len(config.doctors) * 0.2)
+
+    semester_days = defaultdict(set)
+    for pref in config.preferences:
+        if pref.type != "SEMESTER_BLOCK":
+            continue
+        sw = pref.details.get("start_week", 0)
+        ew = pref.details.get("end_week", sw)
+        for week in range(sw, min(ew + 1, num_weeks)):
+            for d in range(week * 7, min((week + 1) * 7, num_days)):
+                semester_days[d].add(pref.doctor_id)
+
+    for day, doc_ids in semester_days.items():
+        if len(doc_ids) > max_vac:
+            ledig_vars = [x[(did, day, "LEDIG")] for did in doc_ids if (did, day, "LEDIG") in x]
+            if ledig_vars:
+                model.add(sum(ledig_vars) <= max_vac)
+
+    # === DETAILED RULES (avancerad regelmotor) ===
+    rule_objective_terms = []
+    if getattr(config, 'detailed_rules', None):
+        try:
+            from rule_engine import RuleEngine
+            engine = RuleEngine(config, config.detailed_rules)
+            rule_objective_terms = engine.compile_to_constraints(
+                model, x, num_days, num_weeks, day_functions, call_functions
+            )
+        except Exception as e:
+            print(f"  ⚠ Regelmotor-fel: {e}")
 
     # === MJUKA CONSTRAINTS ===
 
@@ -444,6 +618,7 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
     w_rest = _rule_weight(config, "atl_weekly_rest", 8)
     w_weekend = _rule_weight(config, "call_weekend_frequency", 5)
     w_site = _rule_weight(config, "preference_site", 3)
+    w_comp = _rule_weight(config, "weekend_compensation", 7)
 
     objective_terms = []
     for bonus_var in st_training_bonus:
@@ -460,6 +635,43 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
         objective_terms.append(-w_weekend * wknd_var)
     for sp_var in site_pref_bonus:
         objective_terms.append(w_site * sp_var)
+    # Helgkompensation bakjour (mjuk penalty)
+    for penalty in weekend_comp_penalties:
+        objective_terms.append(-w_comp * penalty)
+    # Semesterblock (mjuka önskemål)
+    for sv in semester_bonus:
+        objective_terms.append(3 * sv)
+
+    # OB-kostnadsrättvisa
+    if config.optimize_ob_cost:
+        ob_counts = {}
+        for doc in config.doctors:
+            ob_terms = []
+            for day in range(num_days):
+                weekday = day % 7
+                for call_type in ["JOUR_P", "JOUR_B"]:
+                    if (doc.id, day, call_type) in x:
+                        cost = int(_ob_cost(weekday, call_type, config.ob_rates) * 10)
+                        if cost > 0:
+                            ob_terms.append(cost * x[(doc.id, day, call_type)])
+            if ob_terms:
+                ob_counts[doc.id] = model.new_int_var(0, num_days * 40, f"ob_{doc.id}")
+                model.add(ob_counts[doc.id] == sum(ob_terms))
+
+        if ob_counts:
+            max_ob = model.new_int_var(0, num_days * 40, "max_ob")
+            min_ob = model.new_int_var(0, num_days * 40, "min_ob")
+            for doc_id, ob_var in ob_counts.items():
+                model.add(max_ob >= ob_var)
+                model.add(min_ob <= ob_var)
+            ob_spread = model.new_int_var(0, num_days * 40, "ob_spread")
+            model.add(ob_spread == max_ob - min_ob)
+
+            w_ob = _rule_weight(config, "ob_cost_fairness", 4)
+            objective_terms.append(-w_ob * ob_spread)
+
+    # Lägg till regelmotor-termer
+    objective_terms.extend(rule_objective_terms)
 
     if objective_terms:
         model.maximize(sum(objective_terms))
@@ -488,6 +700,157 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
     else:
         print(f"\n❌ Inget schema hittades. Status: {solver.status_name(status)}")
         return None
+
+
+def solve_rolling(
+    config: ClinicConfig,
+    existing_schedule: dict,
+    locked_weeks: int,
+    new_weeks: int = 1,
+    time_limit_seconds: int = 30,
+) -> dict:
+    """Rullande schemauppdatering — behåll låsta veckor, generera nya.
+
+    Args:
+        config: Klinikkonfiguration
+        existing_schedule: Befintligt schema {doc_id: {day_idx: func_id}}
+        locked_weeks: Antal veckor från befintligt schema att behålla
+        new_weeks: Antal nya veckor att generera
+        time_limit_seconds: Max lösartid
+
+    Returns:
+        Kombinerat schema (låsta + nya veckor), eller None om olösbart
+    """
+    total_weeks = locked_weeks + new_weeks
+    locked_days = locked_weeks * 7
+
+    locked = {}
+    for doc_id, days in existing_schedule.items():
+        locked[doc_id] = {}
+        for day_idx, func_id in days.items():
+            day_idx = int(day_idx)
+            if day_idx < locked_days:
+                locked[doc_id][day_idx] = func_id
+
+    return solve_schedule(
+        config,
+        num_weeks=total_weeks,
+        time_limit_seconds=time_limit_seconds,
+        locked_assignments=locked,
+    )
+
+
+def generate_base_schedule(config: ClinicConfig, cycle_weeks: int = 10,
+                           time_limit_seconds: int = 120):
+    """Generera optimalt grundschema för en hel cykel.
+
+    Anropar solve_schedule() med cycle_weeks som num_weeks.
+    Returnerar BaseSchedule-objekt eller None.
+    """
+    from data_model import BaseSchedule, BaseScheduleSlot
+    from datetime import datetime
+
+    schedule = solve_schedule(config, num_weeks=cycle_weeks, time_limit_seconds=time_limit_seconds)
+    if schedule is None:
+        return None
+
+    slots = []
+    for doc_id, days in schedule.items():
+        for day_idx, func_id in days.items():
+            day_idx = int(day_idx)
+            slots.append(BaseScheduleSlot(
+                doctor_id=doc_id,
+                cycle_week=day_idx // 7,
+                weekday=day_idx % 7,
+                function=func_id,
+            ))
+
+    return BaseSchedule(
+        id=f"base_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        name=f"Grundschema {cycle_weeks}v",
+        clinic_id=getattr(config, 'name', 'unknown'),
+        cycle_length_weeks=cycle_weeks,
+        slots=slots,
+        created_at=datetime.now().isoformat(),
+    )
+
+
+def resolve_effective_schedule(base, deviations: list, start_date: str,
+                                num_weeks: int) -> dict:
+    """Beräkna faktiskt schema = grundschema + avvikelser.
+
+    1. Beräkna vilken cykelposition varje datum hamnar på
+    2. Hämta grundschema-slot
+    3. Applicera avvikelser (override)
+    """
+    from datetime import date as dt_date, timedelta
+
+    start = dt_date.fromisoformat(start_date)
+    cycle_len = base.cycle_length_weeks
+
+    # Bygg slot-lookup: (doctor_id, cycle_week, weekday) → function
+    slot_lookup = {}
+    for slot in base.slots:
+        slot_lookup[(slot.doctor_id, slot.cycle_week, slot.weekday)] = slot.function
+
+    # Bygg deviation-lookup: (doctor_id, date) → new_function
+    dev_lookup = {}
+    for dev in deviations:
+        dev_lookup[(dev.doctor_id, dev.date)] = dev.new_function
+
+    # Generera effektivt schema
+    schedule = {}
+    num_days = num_weeks * 7
+    for day_idx in range(num_days):
+        day_date = start + timedelta(days=day_idx)
+        date_str = day_date.isoformat()
+        cycle_week = (day_idx // 7) % cycle_len
+        weekday = day_idx % 7
+
+        for slot in base.slots:
+            doc_id = slot.doctor_id
+            if doc_id not in schedule:
+                schedule[doc_id] = {}
+
+            # Kolla avvikelse först
+            if (doc_id, date_str) in dev_lookup:
+                schedule[doc_id][day_idx] = dev_lookup[(doc_id, date_str)]
+            else:
+                # Hämta från grundschema
+                func = slot_lookup.get((doc_id, cycle_week, weekday), "LEDIG")
+                schedule[doc_id][day_idx] = func
+
+    return schedule
+
+
+def expand_to_granular(schedule: dict, num_days: int) -> dict:
+    """Expandera JOUR_P/JOUR_B till granulära jourtyper baserat på veckodag.
+
+    Vardagar:
+        JOUR_P → JOUR_P_KVÄLL (representerar kopplat kväll+natt-pass)
+        JOUR_B → JOUR_B (bakjour hemifrån, kväll+natt)
+    Helger:
+        JOUR_P → JOUR_P_HELGDAG (lördag) / JOUR_P_HELGNATT (söndag)
+        JOUR_B → JOUR_B_HELGDAG (lördag) / JOUR_B_HELGNATT (söndag)
+    """
+    expanded = {}
+    for doc_id, days in schedule.items():
+        expanded[doc_id] = {}
+        for day, func_id in days.items():
+            weekday = day % 7
+            if weekday < 5:  # Vardag
+                if func_id == "JOUR_P":
+                    expanded[doc_id][day] = "JOUR_P_KVÄLL"
+                else:
+                    expanded[doc_id][day] = func_id
+            else:  # Helg (5=lör, 6=sön)
+                if func_id == "JOUR_P":
+                    expanded[doc_id][day] = "JOUR_P_HELGDAG" if weekday == 5 else "JOUR_P_HELGNATT"
+                elif func_id == "JOUR_B":
+                    expanded[doc_id][day] = "JOUR_B_HELGDAG" if weekday == 5 else "JOUR_B_HELGNATT"
+                else:
+                    expanded[doc_id][day] = func_id
+    return expanded
 
 
 def extract_schedule(solver, x, config, num_days, day_functions, call_functions):
@@ -593,7 +956,7 @@ def print_statistics(schedule, config, num_days, solver, call_counts):
         for day in range(num_days - 1):
             func_today = schedule[doc.id][day]
             func_tomorrow = schedule[doc.id].get(day + 1, "LEDIG")
-            if func_today in ("JOUR_P", "JOUR_B") and func_tomorrow not in ("LEDIG", "JOUR_P", "JOUR_B"):
+            if is_jour(func_today) and not is_jour(func_tomorrow) and func_tomorrow != "LEDIG":
                 violations += 1
                 print(f"  ⚠️  {doc.name}: Jour dag {day+1} → arbete dag {day+2}")
 

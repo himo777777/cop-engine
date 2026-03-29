@@ -306,3 +306,89 @@ class TestReoptimize:
         data = resp.json()
         assert data["status"] == "reoptimized"
         assert "new_schedule_id" in data
+
+
+class TestRollForward:
+    def test_roll_forward_endpoint(self, client, generated_schedule_id):
+        """POST /schedule/roll-forward returnerar nytt schema."""
+        resp = client.post("/schedule/roll-forward", json={
+            "schedule_id": generated_schedule_id,
+            "weeks_to_keep": 1,
+            "new_weeks": 1,
+            "time_limit_seconds": 30,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "rolled_forward"
+        assert data["weeks_kept"] == 1
+        assert data["new_weeks"] == 1
+        assert data["total_weeks"] == 2
+        assert "new_schedule_id" in data
+
+
+class TestOBStatistics:
+    def test_ob_statistics(self, client, generated_schedule_id):
+        """/statistics ska inkludera OB-kostnader."""
+        resp = client.get(f"/statistics/{generated_schedule_id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "ob_costs" in data
+        assert "total_ob_cost" in data
+        assert data["total_ob_cost"] > 0
+
+
+class TestScheduleVersions:
+    def test_schedule_versions(self, client, generated_schedule_id):
+        """Versioner ska skapas vid generering."""
+        resp = client.get(f"/schedule/{generated_schedule_id}/versions")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] >= 1
+        assert data["versions"][0]["change_type"] == "generated"
+
+    def test_schedule_diff(self, client, generated_schedule_id):
+        """Diff mellan version 1 och 1 ska ge 0 ändringar."""
+        resp = client.get(f"/schedule/{generated_schedule_id}/diff/1/1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["changed_assignments"]) == 0
+
+
+class TestAuditLog:
+    def test_audit_log(self, client, generated_schedule_id):
+        """Audit-loggar ska finnas efter schema-generering."""
+        resp = client.get("/audit")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] >= 0
+        assert "logs" in data
+
+    def test_audit_stats(self, client):
+        """Audit-statistik ska returnera struktur."""
+        resp = client.get("/audit/stats")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "total" in data
+        assert "by_action" in data
+
+
+class TestMonthlyReport:
+    def test_monthly_report(self, client, generated_schedule_id):
+        """Månadsrapport ska returnera sammanfattning."""
+        resp = client.get("/reports/monthly?clinic_id=kristianstad")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "summary" in data
+        assert data["summary"]["total_doctors"] == 25
+        assert "call_distribution" in data
+        assert "ob_summary" in data
+
+
+class TestNotifications:
+    def test_notifications_crud(self, client):
+        """Skapa och hämta notifieringar."""
+        # Hämta (tom lista)
+        resp = client.get("/notifications/test_user")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["unread_count"] == 0
