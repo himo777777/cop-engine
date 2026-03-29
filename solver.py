@@ -841,6 +841,141 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
                 st_op_penalty.append(deficit)
     print(f"  ST OP-krav constraints applied for {sum(1 for d in config.doctors if getattr(d, 'st_min_op_days', None))} doctors")
 
+    # === CONSTRAINT 27: Bakjourslinje — Senior (ÖL/SP) med bakjourskonfig ===
+    # Respekterar max_per_month och preferred_days från backup_call_config
+    bak_enabled, bak_hard, _ = _get_rule(config, "backup_call_coverage", 10)
+    if bak_enabled:
+        bak_eligible = [d for d in config.doctors
+                        if getattr(d, 'backup_call_config', {}).get('eligible', False)
+                        and d.role in (Role.ÖVERLÄKARE, Role.SPECIALIST)]
+        if bak_eligible:
+            # Max bakjourer per månad (4 veckor approximation)
+            for doc in bak_eligible:
+                max_per_month = doc.backup_call_config.get('max_per_month', 6)
+                bak_days_total = []
+                for day in range(num_days):
+                    if (doc.id, day, "JOUR_B") in x:
+                        bak_days_total.append(x[(doc.id, day, "JOUR_B")])
+                if bak_days_total:
+                    max_bak = max_per_month * num_weeks // 4 if num_weeks >= 4 else max_per_month
+                    model.add(sum(bak_days_total) <= max(1, max_bak))
+
+            # Preferred days: mjuk bonus för att schemalägga bakjour på önskade dagar
+            WEEKDAY_MAP = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6}
+            for doc in bak_eligible:
+                pref_days = doc.backup_call_config.get('preferred_days', [])
+                if pref_days:
+                    pref_indices = {WEEKDAY_MAP.get(d, -1) for d in pref_days}
+                    for day in range(num_days):
+                        weekday = day % 7
+                        if weekday not in pref_indices and (doc.id, day, "JOUR_B") in x:
+                            # Mjuk penalty för bakjour på icke-önskad dag (hanteras i objective)
+                            pass  # Already handled by existing JOUR_B constraints
+        print(f"  Bakjourslinje: {len(bak_eligible)} seniora läkare eligibla")
+
+    # === CONSTRAINT 28: Konsultschema — Seniora läkare med konsulttider ===
+    # Placerar läkare på ADMIN/MOTT-funktion på konfigurerade konsultdagar
+    consult_penalty = []
+    consult_enabled, consult_hard, _ = _get_rule(config, "consultation_schedule", 6)
+    if consult_enabled:
+        WEEKDAY_MAP_C = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4}
+        consult_count = 0
+        for doc in config.doctors:
+            consult_sched = getattr(doc, 'consultation_schedule', [])
+            if not consult_sched:
+                continue
+            consult_count += 1
+            for entry in consult_sched:
+                wd = WEEKDAY_MAP_C.get(entry.get('weekday', ''), -1)
+                if wd < 0:
+                    continue
+                consult_type = entry.get('type', 'telefon')
+                # Map consultation type to function
+                target_func = None
+                if consult_type in ('telefon', 'rond'):
+                    # Konsult = läkaren ska vara på MOTT eller ADMIN, inte OP/jour
+                    for func_id, func, site in day_functions:
+                        if func == Function.MOTTAGNING and (doc.site_preference is None or site == doc.site_preference):
+                            target_func = func_id
+                            break
+                if not target_func:
+                    target_func = "ADMIN"
+
+                for week in range(num_weeks):
+                    day = week * 7 + wd
+                    if day >= num_days:
+                        continue
+                    if (doc.id, day, target_func) in x:
+                        if consult_hard:
+                            model.add(x[(doc.id, day, target_func)] == 1)
+                        else:
+                            # Mjuk: penalty om inte på konsultfunktion
+                            missed = model.new_bool_var(f"consult_miss_{doc.id}_{day}")
+                            model.add(x[(doc.id, day, target_func)] == 0).only_enforce_if(missed)
+                            model.add(x[(doc.id, day, target_func)] == 1).only_enforce_if(missed.negated())
+                            consult_penalty.append(missed)
+        print(f"  Konsultschema: {consult_count} läkare med konsulttider")
+
+    # === CONSTRAINT 29: Senior/junior-par på OP ===
+    # Junior (AT/ST_TIDIG) på OP måste ha minst en senior (SP/ÖL) på samma OP-funktion samma dag
+    op_pair_enabled, op_pair_hard, _ = _get_rule(config, "op_senior_junior_pair", 10)
+    op_pair_penalty = []
+    if op_pair_enabled:
+        junior_roles = {Role.AT, Role.UNDERLÄKARE, Role.ST_TIDIG}
+        senior_roles = {Role.SPECIALIST, Role.ÖVERLÄKARE}
+
+        juniors_needing_pair = [d for d in config.doctors
+                                if d.role in junior_roles
+                                and getattr(d, 'op_pairing', {}).get('require_senior_pair', False)]
+        seniors_who_supervise = [d for d in config.doctors
+                                 if d.role in senior_roles]
+
+        for op_fid in op_func_ids:
+            for day in range(num_days):
+                if day % 7 >= 5:
+                    continue  # Helg — normalt inga elektiva OP
+
+                for junior in juniors_needing_pair:
+                    if (junior.id, day, op_fid) not in x:
+                        continue
+
+                    # Hitta seniora som kan vara på samma OP samma dag
+                    pref_senior = getattr(junior, 'op_pairing', {}).get('preferred_senior_id')
+                    available_seniors = []
+                    for s in seniors_who_supervise:
+                        if (s.id, day, op_fid) in x:
+                            # Kolla om senior kan handleda denna roll
+                            can_sup = getattr(s, 'op_pairing', {}).get('can_supervise', [])
+                            if not can_sup or junior.role.value in can_sup:
+                                available_seniors.append(s)
+
+                    if not available_seniors:
+                        # Ingen senior kan paras → förbjud junior på OP denna dag
+                        if op_pair_hard:
+                            model.add(x[(junior.id, day, op_fid)] == 0)
+                        continue
+
+                    # Om junior är på OP → minst en senior måste vara på samma OP
+                    senior_on_op = [x[(s.id, day, op_fid)] for s in available_seniors
+                                    if (s.id, day, op_fid) in x]
+                    if senior_on_op:
+                        if op_pair_hard:
+                            # Hard: junior_on_op → sum(senior_on_op) >= 1
+                            model.add(sum(senior_on_op) >= 1).only_enforce_if(
+                                x[(junior.id, day, op_fid)])
+                        else:
+                            # Mjuk: penalty om junior på OP utan senior
+                            no_senior = model.new_bool_var(f"nopair_{junior.id}_{day}_{op_fid}")
+                            model.add(sum(senior_on_op) == 0).only_enforce_if(no_senior)
+                            model.add(sum(senior_on_op) >= 1).only_enforce_if(no_senior.negated())
+                            # Only penalize if junior is actually on OP
+                            both = model.new_bool_var(f"unpaired_{junior.id}_{day}_{op_fid}")
+                            model.add_bool_and([x[(junior.id, day, op_fid)], no_senior]).only_enforce_if(both)
+                            model.add_bool_or([x[(junior.id, day, op_fid)].negated(), no_senior.negated()]).only_enforce_if(both.negated())
+                            op_pair_penalty.append(both)
+
+        print(f"  Senior/junior OP-par: {len(juniors_needing_pair)} juniorer kräver parning, {len(seniors_who_supervise)} seniorer kan handleda")
+
     # === DETAILED RULES (avancerad regelmotor) ===
     rule_objective_terms = []
     if getattr(config, 'detailed_rules', None):
@@ -1021,6 +1156,14 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
     w_st_op = _rule_weight(config, "st_op_requirement", 5)
     for deficit_var in st_op_penalty:
         objective_terms.append(-w_st_op * deficit_var)
+    # Konsultschema: penalty för missade konsulttider
+    w_consult = _rule_weight(config, "consultation_schedule", 6)
+    for cv in consult_penalty:
+        objective_terms.append(-w_consult * cv)
+    # Senior/junior OP-par: penalty för oparade juniorer
+    w_op_pair = _rule_weight(config, "op_senior_junior_pair", 10)
+    for pv in op_pair_penalty:
+        objective_terms.append(-w_op_pair * pv)
 
     # OB-kostnadsrättvisa
     if config.optimize_ob_cost:

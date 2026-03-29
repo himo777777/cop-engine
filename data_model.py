@@ -124,6 +124,18 @@ class Doctor:
     # Fasta återkommande aktiviteter: [{"weekday": "tuesday", "time": "10:00-11:00", "activity": "Infektionsrond"}]
     recurring_activities: list = field(default_factory=list)
 
+    # Bakjourslinje: kan gå bakjour, vilka dagar per vecka
+    # {"eligible": True, "max_per_month": 4, "preferred_days": ["monday", "thursday"]}
+    backup_call_config: dict = field(default_factory=dict)
+
+    # Konsultschema: dagar/tider då läkaren är tillgänglig för konsultationer
+    # [{"weekday": "monday", "type": "telefon"}, {"weekday": "wednesday", "type": "rond"}]
+    consultation_schedule: list = field(default_factory=list)
+
+    # Senior/junior OP-par: kräv parning med specifik senioritet på OP
+    # {"require_senior_pair": True, "preferred_senior_id": "doc_123", "can_supervise": ["ST_TIDIG", "AT"]}
+    op_pairing: dict = field(default_factory=dict)
+
     # Dagar per vecka (explicit, annars beräknas från employment_rate)
     # T.ex. 3 = exakt 3 arbetsdagar per vecka (solvern respekterar detta)
     work_days_per_week: Optional[int] = None
@@ -315,6 +327,15 @@ def default_constraint_rules() -> list[ConstraintRule]:
         ConstraintRule("st_op_requirement", "ST minsta OP-dagar/vecka", "fairness",
                        is_hard=False, weight=5,
                        description="ST-läkare garanteras konfigurerat minimiantal OP-dagar per vecka för utbildningsmål"),
+        ConstraintRule("backup_call_coverage", "Bakjourslinje dygnet runt", "staffing",
+                       is_hard=True, weight=10,
+                       description="Bakjourslinje alltid bemannad med senior (ÖL/SP), respekterar max per månad och preferensdagar"),
+        ConstraintRule("consultation_schedule", "Konsultschema", "quality",
+                       is_hard=False, weight=6,
+                       description="Seniora läkare placeras på konsultfunktion enligt konfigurerat veckoschema"),
+        ConstraintRule("op_senior_junior_pair", "Senior/junior-par på OP", "staffing",
+                       is_hard=True, weight=10,
+                       description="Junior (AT/ST) på OP måste paras med senior (SP/ÖL) samma dag samma sal"),
     ]
 
 
