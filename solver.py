@@ -139,7 +139,7 @@ def _build_functions(config: ClinicConfig):
         ("JOUR_B", Function.BAKJOUR, None),
     ]
 
-    return day_functions, call_functions, op_funcs_by_site
+    return day_functions, call_functions, op_funcs_by_site, sorted(akut_sites)
 
 
 def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds: int = 30,
@@ -164,7 +164,7 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
     doc_by_id = {d.id: d for d in config.doctors}
 
     # Bygg funktioner dynamiskt
-    day_functions, call_functions, op_funcs_by_site = _build_functions(config)
+    day_functions, call_functions, op_funcs_by_site, akut_sites = _build_functions(config)
 
     # === BESLUTSVARIABLER ===
     x = {}
