@@ -32,7 +32,7 @@ class TestSolverBasic:
                 assert d in days, f"{doc_id} saknar dag {d}"
 
     def test_schedule_uses_valid_functions(self, full_config, solved_schedule):
-        day_funcs, call_funcs, _ = _build_functions(full_config)
+        day_funcs, call_funcs, _, _ = _build_functions(full_config)
         valid = {f[0] for f in day_funcs} | {f[0] for f in call_funcs} | {"LEDIG"}
         for doc_id, days in solved_schedule.items():
             for d, func in days.items():
@@ -61,7 +61,7 @@ class TestConstraint2_MinStaffing:
 
     def test_weekday_operations(self, full_config, solved_schedule):
         """Vardagar ska ha läkare på operation per site."""
-        _, _, op_funcs = _build_functions(full_config)
+        _, _, op_funcs, _ = _build_functions(full_config)
         for day in range(14):
             if day % 7 >= 5:
                 continue
@@ -70,7 +70,7 @@ class TestConstraint2_MinStaffing:
                 assert count >= 1, f"Dag {day}: ingen {op_func_id}"
 
     def test_weekday_avdelning(self, full_config, solved_schedule):
-        day_funcs, _, _ = _build_functions(full_config)
+        day_funcs, _, _, _ = _build_functions(full_config)
         avd_funcs = {f[0] for f in day_funcs if f[1].value == "AVD"}
         for day in range(14):
             if day % 7 >= 5:
@@ -150,7 +150,7 @@ class TestConstraint7_ORCapacity:
     """Constraint 7: Max läkare per site = salar × 2."""
 
     def test_or_capacity_per_site(self, full_config, solved_schedule):
-        _, _, op_funcs = _build_functions(full_config)
+        _, _, op_funcs, _ = _build_functions(full_config)
         for site, op_func_id in op_funcs.items():
             max_rooms = sum(1 for r in full_config.operating_rooms if r.site == site)
             max_docs = max_rooms * 2
@@ -220,7 +220,7 @@ class TestGenericSolver:
         assert len(schedule) == 18
 
     def test_generic_functions_are_dynamic(self, generic_config):
-        day_funcs, call_funcs, op_funcs = _build_functions(generic_config)
+        day_funcs, call_funcs, op_funcs, _ = _build_functions(generic_config)
         assert "OP_Huvudsjukhuset" in op_funcs.values()
         assert any("AVD_" in f[0] for f in day_funcs)
         assert any("MOTT_" in f[0] for f in day_funcs)
@@ -228,7 +228,7 @@ class TestGenericSolver:
     def test_generic_schedule_valid(self, generic_config):
         schedule = solve_schedule(generic_config, num_weeks=1, time_limit_seconds=15)
         assert schedule is not None
-        day_funcs, call_funcs, _ = _build_functions(generic_config)
+        day_funcs, call_funcs, _, _ = _build_functions(generic_config)
         valid = {f[0] for f in day_funcs} | {f[0] for f in call_funcs} | {"LEDIG"}
         for doc_id, days in schedule.items():
             for d, func in days.items():

@@ -156,15 +156,27 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
     Returns:
         dict med schemat, eller None om olösbart
     """
+    from datetime import date as dt_date, timedelta
+
     model = cp_model.CpModel()
 
     num_days = num_weeks * 7
+
+    # start_date behövs för AT-rotation och ST-randning (datumbaserade constraints)
+    start_date = getattr(config, 'schedule_start_date', None)
+    if start_date and isinstance(start_date, str):
+        start_date = dt_date.fromisoformat(start_date)
+    if not start_date:
+        start_date = dt_date.today()
 
     doc_ids = [d.id for d in config.doctors]
     doc_by_id = {d.id: d for d in config.doctors}
 
     # Bygg funktioner dynamiskt
     day_functions, call_functions, op_funcs_by_site, akut_sites = _build_functions(config)
+
+    # OP-funktions-IDs (behövs i flera constraints)
+    op_func_ids = list(op_funcs_by_site.values())
 
     # === BESLUTSVARIABLER ===
     x = {}
@@ -704,9 +716,9 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
                 day = week * 7 + d_offset
                 if day >= num_days:
                     break
-                for f in day_functions:
-                    if (doc.id, day, f) in x:
-                        week_senior_work.append(x[(doc.id, day, f)])
+                for func_id, _, _ in day_functions:
+                    if (doc.id, day, func_id) in x:
+                        week_senior_work.append(x[(doc.id, day, func_id)])
 
         # At least min_senior_per_week seniors should work in this week
         if week_senior_work:
@@ -715,7 +727,7 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
     # === CONSTRAINT 24: Kontinuitetskrav (COC) — Gruppera MOTT-dagar per läkare per vecka ===
     # Om en läkare har mottagning (MOTT_*) under en vecka, försök samla dem
     # på konsekutiva dagar istället för utspridda. Mjukt constraint via penalty.
-    mott_functions = [f for f in day_functions if f.startswith("MOTT")]
+    mott_functions = [fid for fid, _, _ in day_functions if fid.startswith("MOTT")]
     coc_penalty_terms = []
 
     for doc in config.doctors:
@@ -785,9 +797,8 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
             if (doc.id, day, required_func) in x:
                 model.add(x[(doc.id, day, required_func)] == 1)
             else:
-                # If the function doesn't exist, penalize
-                for func_id in day_functions:
-                    fid = func_id if isinstance(func_id, str) else func_id[0]
+                # If the function doesn't exist as-is, search in day_functions tuples
+                for fid, _, _ in day_functions:
                     if (doc.id, day, fid) in x and fid == required_func:
                         model.add(x[(doc.id, day, fid)] == 1)
                         break
@@ -821,8 +832,7 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
             for d_offset in range(min(5, num_days - ws)):
                 day = ws + d_offset
                 day_op_vars = []
-                for func_id in day_functions:
-                    fid = func_id if isinstance(func_id, str) else func_id[0]
+                for fid, _, _ in day_functions:
                     if fid.startswith("OP") and (doc.id, day, fid) in x:
                         day_op_vars.append(x[(doc.id, day, fid)])
                 if day_op_vars:
@@ -975,7 +985,7 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
             model.add(min_calls <= count_var)
 
     # ST-utbildning: maximera op-dagar med handledare (generisk)
-    op_func_ids = list(op_funcs_by_site.values())
+    # op_func_ids redan definierad ovan
     st_training_bonus = []
     for doc in config.doctors:
         if doc.supervisor_id and doc.required_procedures:

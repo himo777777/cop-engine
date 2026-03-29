@@ -345,6 +345,7 @@ class ClinicConfig:
     comp_time_rates: "CompTimeRates" = None
     auto_plan_comp_days: bool = True
     max_comp_balance_days: float = 20.0
+    schedule_start_date: str = ""  # ISO-format "2026-04-01", tom = idag
 
 
 # === GRUNDSCHEMA ===
@@ -748,6 +749,16 @@ def config_to_dict(config: ClinicConfig) -> dict:
                 "current_rotation_block": d.current_rotation_block,
                 "recurring_activities": d.recurring_activities,
                 "work_days_per_week": d.work_days_per_week,
+                # Nya per-doktor fält
+                "at_weekly_rotation": d.at_weekly_rotation,
+                "at_rotation_period": d.at_rotation_period,
+                "st_randning": d.st_randning,
+                "st_min_op_days": d.st_min_op_days,
+                "st_required_op_types": d.st_required_op_types,
+                "st_target_procedures": d.st_target_procedures,
+                "backup_call_config": d.backup_call_config,
+                "consultation_schedule": d.consultation_schedule,
+                "op_pairing": d.op_pairing,
             } for d in config.doctors
         ],
         "operating_rooms": [
@@ -853,6 +864,16 @@ def dict_to_config(data: dict) -> ClinicConfig:
             current_rotation_block=d.get("current_rotation_block", {}),
             recurring_activities=d.get("recurring_activities", []),
             work_days_per_week=d.get("work_days_per_week"),
+            # Nya per-doktor fält
+            at_weekly_rotation=d.get("at_weekly_rotation", {}),
+            at_rotation_period=d.get("at_rotation_period", {}),
+            st_randning=d.get("st_randning", []),
+            st_min_op_days=d.get("st_min_op_days"),
+            st_required_op_types=d.get("st_required_op_types", []),
+            st_target_procedures=d.get("st_target_procedures", {}),
+            backup_call_config=d.get("backup_call_config", {}),
+            consultation_schedule=d.get("consultation_schedule", []),
+            op_pairing=d.get("op_pairing", {}),
         ) for d in data.get("doctors", [])
     ]
     rooms = [
@@ -928,6 +949,7 @@ def dict_to_config(data: dict) -> ClinicConfig:
         constraint_rules=rules,
         schedule_cycle_weeks=data.get("schedule_cycle_weeks", 10),
         travel_time_between_sites_min=data.get("travel_time_between_sites_min", 0),
+        schedule_start_date=data.get("schedule_start_date", ""),
     )
 
 

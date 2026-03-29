@@ -117,7 +117,7 @@ class TestAction:
     def test_resolve_functions_by_site(self, config):
         """sites=['CSK'] → OP_CSK, AVD_CSK, MOTT_CSK."""
         from solver import _build_functions
-        day_funcs, call_funcs, _ = _build_functions(config)
+        day_funcs, call_funcs, _, _ = _build_functions(config)
         engine = RuleEngine(config, [])
         action = ActionSpec(action_type="require_count", sites=["CSK"])
         funcs = engine._resolve_functions(action, day_funcs, call_funcs)
@@ -134,7 +134,7 @@ class TestCompilation:
         from solver import _build_functions
 
         model = cp_model.CpModel()
-        day_funcs, call_funcs, _ = _build_functions(config)
+        day_funcs, call_funcs, _, _ = _build_functions(config)
         num_days = 14
         num_weeks = 2
 
@@ -162,7 +162,7 @@ class TestCompilation:
         from solver import _build_functions
 
         model = cp_model.CpModel()
-        day_funcs, call_funcs, _ = _build_functions(config)
+        day_funcs, call_funcs, _, _ = _build_functions(config)
         x = {}
         for doc in config.doctors:
             for day in range(14):
