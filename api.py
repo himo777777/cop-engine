@@ -360,6 +360,9 @@ async def get_ui_config(clinic_id: str):
 
     # Tillgängliga sites
     sites = config.sites or []
+    clinic_type = getattr(config, 'clinic_type', 'kirurgi')
+    has_on_call = getattr(config, 'has_on_call', True)
+    has_operations = getattr(config, 'has_operations', True)
 
     # Roller som finns i kliniken (baserat på faktiska läkare)
     active_roles = sorted(set(d.role.value for d in config.doctors))
@@ -367,18 +370,80 @@ async def get_ui_config(clinic_id: str):
         "AT": "AT-läkare", "UL": "Underläkare",
         "ST_TIDIG": "ST-läkare (tidig)", "ST_SEN": "ST-läkare (senior)",
         "SP": "Specialist", "ÖL": "Överläkare",
+        "DL": "Distriktsläkare", "SSK": "Sjuksköterska",
+        "USK": "Undersköterska", "FT": "Fysioterapeut",
+        "PSY": "Psykolog", "BM": "Barnmorska",
+        "KUR": "Kurator", "DIET": "Dietist",
+        "AT_TERAPEUT": "Arbetsterapeut", "CUSTOM": "Annan",
     }
     roles = [{"value": r, "label": role_labels.get(r, r)} for r in active_roles]
     # Inkludera alla roller (för att kunna lägga till nya läkare)
     all_roles = [{"value": r.value, "label": role_labels.get(r.value, r.value)} for r in Role]
+    # Lägg till custom roles
+    for cr in getattr(config, 'custom_roles', []):
+        cr_id = cr.get("id", "")
+        cr_label = cr.get("label", cr_id)
+        if cr_id and not any(r["value"] == cr_id for r in all_roles):
+            all_roles.append({"value": cr_id, "label": cr_label})
 
-    # Funktioner — bygg dynamiskt från sites + operationssalar
+    # Funktioner — bygg dynamiskt från sites + verksamhetstyp
     day_functions = []
+
+    # OP-funktioner (bara om verksamheten har operationer)
+    if has_operations:
+        for site in sites:
+            day_functions.append({"value": f"OP_{site}", "label": f"OP {site}", "category": "operation", "site": site})
+
+    # Verksamhetstyp-specifika funktioner per site
+    _CLINIC_TYPE_SITE_FUNCS = {
+        "kirurgi": [
+            ("AVD", "Avdelning", "vård"),
+            ("MOTT", "Mottagning", "mottagning"),
+            ("AKUT", "Akut", "akut"),
+        ],
+        "internmedicin": [
+            ("AVD", "Avdelning", "vård"),
+            ("MOTT", "Mottagning", "mottagning"),
+            ("ROND", "Rond", "vård"),
+            ("DIALYS", "Dialys", "vård"),
+            ("DAGVÅRD", "Dagvård", "vård"),
+        ],
+        "vardcentral": [
+            ("MOTT", "Mottagning", "mottagning"),
+            ("BVC", "BVC", "mottagning"),
+            ("MVC", "MVC", "mottagning"),
+            ("LAB", "Lab", "mottagning"),
+            ("TELEFON", "Telefontid", "mottagning"),
+            ("HEMBESÖK", "Hembesök", "mottagning"),
+            ("VIDEO", "Videomottagning", "mottagning"),
+        ],
+        "oppenvard": [
+            ("MOTT", "Mottagning", "mottagning"),
+        ],
+        "psykiatri": [
+            ("AVD", "Avdelning", "vård"),
+            ("MOTT", "Mottagning", "mottagning"),
+            ("SAMTAL", "Samtal", "mottagning"),
+            ("GRUPP", "Gruppterapi", "mottagning"),
+            ("AKUTPSYK", "Akutpsykiatri", "akut"),
+        ],
+        "rehabilitering": [
+            ("MOTT", "Mottagning", "mottagning"),
+            ("REHAB", "Rehabilitering", "vård"),
+        ],
+    }
+
+    site_funcs = _CLINIC_TYPE_SITE_FUNCS.get(clinic_type, [
+        ("AVD", "Avdelning", "vård"),
+        ("MOTT", "Mottagning", "mottagning"),
+    ])
     for site in sites:
-        day_functions.append({"value": f"OP_{site}", "label": f"OP {site}", "category": "operation", "site": site})
-        day_functions.append({"value": f"AVD_{site}", "label": f"Avdelning {site}", "category": "vård", "site": site})
-        day_functions.append({"value": f"MOTT_{site}", "label": f"Mottagning {site}", "category": "mottagning", "site": site})
-        day_functions.append({"value": f"AKUT_{site}", "label": f"Akut {site}", "category": "akut", "site": site})
+        for func_id, func_label, func_cat in site_funcs:
+            day_functions.append({
+                "value": f"{func_id}_{site}", "label": f"{func_label} {site}",
+                "category": func_cat, "site": site,
+            })
+
     # Icke-platsspecifika
     day_functions.extend([
         {"value": "ADMIN", "label": "Admin", "category": "admin", "site": None},
@@ -388,24 +453,48 @@ async def get_ui_config(clinic_id: str):
         {"value": "LEDIG", "label": "Ledig", "category": "frånvaro", "site": None},
     ])
 
+    # Custom functions
+    for cf in getattr(config, 'custom_functions', []):
+        cf_id = cf.get("id", "")
+        cf_label = cf.get("label", cf_id)
+        cf_cat = cf.get("category", "annan")
+        cf_site = cf.get("site_specific", False)
+        if cf_id:
+            if cf_site:
+                for site in sites:
+                    day_functions.append({
+                        "value": f"{cf_id}_{site}", "label": f"{cf_label} {site}",
+                        "category": cf_cat, "site": site,
+                    })
+            else:
+                day_functions.append({
+                    "value": cf_id, "label": cf_label,
+                    "category": cf_cat, "site": None,
+                })
+
     # Operationssalar
     rooms = [{"id": r.id, "site": r.site, "name": r.name,
               "available_days": r.available_days} for r in config.operating_rooms]
 
-    # Jourlinjer
-    call_functions = [
-        {"value": "JOUR_P", "label": "Primärjour"},
-        {"value": "JOUR_B", "label": "Bakjour"},
-    ]
+    # Jourlinjer (bara om verksamheten har jour)
+    call_functions = []
+    if has_on_call:
+        call_functions = [
+            {"value": "JOUR_P", "label": "Primärjour"},
+            {"value": "JOUR_B", "label": "Bakjour"},
+        ]
 
-    # Skifttyper (dag, kväll, natt, helg)
+    # Skifttyper
     shift_types = [
         {"value": "DAG", "label": "Dag (07-16:30)"},
-        {"value": "JOUR_KVÄLL", "label": "Kvällsjour (16:30-22)"},
-        {"value": "JOUR_NATT", "label": "Nattjour (22-07)"},
-        {"value": "JOUR_HELGDAG", "label": "Helgdag (07-22)"},
-        {"value": "JOUR_HELGNATT", "label": "Helgnatt (22-07)"},
     ]
+    if has_on_call:
+        shift_types.extend([
+            {"value": "JOUR_KVÄLL", "label": "Kvällsjour (16:30-22)"},
+            {"value": "JOUR_NATT", "label": "Nattjour (22-07)"},
+            {"value": "JOUR_HELGDAG", "label": "Helgdag (07-22)"},
+            {"value": "JOUR_HELGNATT", "label": "Helgnatt (22-07)"},
+        ])
 
     # Bemanningskrav
     staffing = [{"function": sr.function.value, "site": sr.site,
@@ -424,6 +513,9 @@ async def get_ui_config(clinic_id: str):
     return {
         "clinic_id": clinic_id,
         "clinic_name": config.name,
+        "clinic_type": clinic_type,
+        "has_on_call": has_on_call,
+        "has_operations": has_operations,
         "sites": sites,
         "roles": roles,
         "all_roles": all_roles,
@@ -436,6 +528,8 @@ async def get_ui_config(clinic_id: str):
         "randning_kliniker": randning_kliniker,
         "schedule_cycle_weeks": config.schedule_cycle_weeks,
         "travel_time_between_sites_min": config.travel_time_between_sites_min,
+        "custom_roles": getattr(config, 'custom_roles', []),
+        "custom_functions": getattr(config, 'custom_functions', []),
     }
 
 
@@ -455,6 +549,13 @@ class ClinicConfigInput(BaseModel):
     constraint_rules: list[dict] = []
     schedule_cycle_weeks: int = 10
     travel_time_between_sites_min: int = 0
+    schedule_start_date: str = ""
+    optimize_ob_cost: bool = True
+    clinic_type: str = "kirurgi"
+    has_on_call: bool = True
+    has_operations: bool = True
+    custom_roles: list[dict] = []
+    custom_functions: list[dict] = []
 
 @app.post("/config", tags=["Konfiguration"])
 async def create_config(clinic_id: str, body: ClinicConfigInput):

@@ -12,13 +12,28 @@ from typing import Optional
 
 
 class Role(Enum):
-    """Läkarroller i hierarkin."""
+    """
+    Standardroller i sjukvårdshierarkin.
+    Kliniker kan ha ytterligare roller via ClinicConfig.custom_roles.
+    Alla rollvärden jämförs som strängar — custom roles använder sitt id direkt.
+    """
     AT = "AT"                  # AT-läkare (allmäntjänstgöring)
     UNDERLÄKARE = "UL"
     ST_TIDIG = "ST_TIDIG"      # ST år 1-3
     ST_SEN = "ST_SEN"          # ST år 4-5
     SPECIALIST = "SP"
     ÖVERLÄKARE = "ÖL"
+    # Generiska roller för icke-kirurgiska verksamheter
+    DISTRIKTSLÄKARE = "DL"     # Vårdcentraler
+    SJUKSKÖTERSKA = "SSK"      # Alla verksamheter
+    UNDERSKÖTERSKA = "USK"     # Avdelning, vårdcentral
+    FYSIOTERAPEUT = "FT"       # Rehab, vårdcentral
+    PSYKOLOG = "PSY"           # Psykiatri, vårdcentral
+    BARNMORSKA = "BM"          # MVC, förlossning
+    KURATOR = "KUR"            # Alla verksamheter
+    DIETIST = "DIET"           # Vårdcentral, internmedicin
+    ARBETSTERAPEUT = "AT_TERAPEUT"  # Rehab
+    CUSTOM = "CUSTOM"          # Platsinnehavare — custom_roles i config har detaljer
 
 
 class ShiftType(Enum):
@@ -31,7 +46,12 @@ class ShiftType(Enum):
 
 
 class Function(Enum):
-    """Kliniska funktioner/stationer."""
+    """
+    Kliniska funktioner/stationer.
+    Standardfunktioner täcker de vanligaste verksamhetstyperna.
+    Kliniker kan lägga till egna via ClinicConfig.custom_functions.
+    """
+    # === Kirurgi / slutenvård ===
     OPERATION = "OP"
     AVDELNING = "AVD"
     MOTTAGNING = "MOTT"
@@ -39,20 +59,37 @@ class Function(Enum):
     PRIMÄRJOUR = "JOUR_PRIMÄR"
     BAKJOUR = "JOUR_BAK"
     # Granulära jourtyper (används i expanderat schema)
-    JOUR_P_KVÄLL = "JOUR_P_KVÄLL"        # Primärjour kväll 16:30-22:00
-    JOUR_P_NATT = "JOUR_P_NATT"          # Primärjour natt 22:00-07:00
-    JOUR_P_HELGDAG = "JOUR_P_HELGDAG"    # Primärjour helgdag 07:00-22:00
-    JOUR_P_HELGNATT = "JOUR_P_HELGNATT"  # Primärjour helgnatt 22:00-07:00
-    JOUR_B_HELGDAG = "JOUR_B_HELGDAG"    # Bakjour helgdag
-    JOUR_B_HELGNATT = "JOUR_B_HELGNATT"  # Bakjour helgnatt
-    ADMIN = "ADMIN"            # MDT, rond, administration
-    FORSKNING = "FORSKNING"    # Forskningsdagar
-    HANDLEDNING = "HANDLEDNING"  # ST-handledning, AT-handledning
-    UTBILDNING = "UTBILDNING"  # Kurser, konferenser, intern utbildning
-    AKUT = "AKUT"              # Akutmottagningspass (dagtid)
+    JOUR_P_KVÄLL = "JOUR_P_KVÄLL"
+    JOUR_P_NATT = "JOUR_P_NATT"
+    JOUR_P_HELGDAG = "JOUR_P_HELGDAG"
+    JOUR_P_HELGNATT = "JOUR_P_HELGNATT"
+    JOUR_B_HELGDAG = "JOUR_B_HELGDAG"
+    JOUR_B_HELGNATT = "JOUR_B_HELGNATT"
+    # === Generella ===
+    ADMIN = "ADMIN"
+    FORSKNING = "FORSKNING"
+    HANDLEDNING = "HANDLEDNING"
+    UTBILDNING = "UTBILDNING"
+    AKUT = "AKUT"
     LEDIG = "LEDIG"
     SEMESTER = "SEMESTER"
-    KOMPLEDIGHET = "KOMPLEDIGHET"  # Kompensationsledighet efter helgjour
+    KOMPLEDIGHET = "KOMPLEDIGHET"
+    # === Vårdcentral / öppenvård ===
+    BVC = "BVC"                # Barnavårdscentral
+    MVC = "MVC"                # Mödravårdscentral
+    LAB = "LAB"                # Provtagning/lab
+    REHAB = "REHAB"            # Rehabilitering
+    TELEFONTID = "TELEFON"     # Telefontid / rådgivning
+    HEMBESÖK = "HEMBESÖK"      # Hembesök
+    VIDEOMOTTAGNING = "VIDEO"  # Digitala besök
+    # === Internmedicin ===
+    ROND = "ROND"              # Avdelningsrond
+    DIALYS = "DIALYS"          # Dialysmottagning
+    DAGVÅRD = "DAGVÅRD"        # Dagvårdsavdelning
+    # === Psykiatri ===
+    SAMTAL = "SAMTAL"          # Terapeutiska samtal
+    GRUPPTERAPI = "GRUPP"      # Gruppterapi
+    AKUTPSYK = "AKUTPSYK"      # Akutpsykiatri
 
 
 # Site is now a plain string, not an enum.
@@ -346,6 +383,30 @@ class ClinicConfig:
     auto_plan_comp_days: bool = True
     max_comp_balance_days: float = 20.0
     schedule_start_date: str = ""  # ISO-format "2026-04-01", tom = idag
+
+    # === GENERISK VERKSAMHETSTYP ===
+    # clinic_type styr vilka defaultregler och funktioner som gäller
+    # "kirurgi" (default), "internmedicin", "vardcentral", "oppenvard",
+    # "psykiatri", "rehabilitering", "radiologi", "annan"
+    clinic_type: str = "kirurgi"
+
+    # True = kliniken har jourverksamhet (primär + bakjour), False = ingen jour
+    has_on_call: bool = True
+
+    # True = kliniken har operationsverksamhet, False = ingen OP
+    has_operations: bool = True
+
+    # Klinikdefinierade roller (utöver standardrollerna AT/UL/ST/SP/ÖL)
+    # T.ex. för vårdcentral: ["DISTRIKTSLÄKARE", "SJUKSKÖTERSKA", "UNDERSKÖTERSKA",
+    #   "FYSIOTERAPEUT", "PSYKOLOG", "BARNMORSKA", "DIETIST", "KURATOR"]
+    custom_roles: list[dict] = field(default_factory=list)
+    # Format: [{"id": "SSK", "label": "Sjuksköterska", "seniority": 2, "can_call": False}]
+
+    # Klinikdefinierade funktioner (utöver standardfunktioner)
+    # T.ex. för vårdcentral: ["BVC", "MVC", "LAB", "REHAB", "TELEFONTID", "HEMBESÖK"]
+    custom_functions: list[dict] = field(default_factory=list)
+    # Format: [{"id": "BVC", "label": "Barnavårdscentral", "category": "mottagning",
+    #           "requires_roles": ["SSK", "DISTRIKTSLÄKARE"], "site_specific": True}]
 
 
 # === GRUNDSCHEMA ===
@@ -807,6 +868,14 @@ def config_to_dict(config: ClinicConfig) -> dict:
         ],
         "schedule_cycle_weeks": config.schedule_cycle_weeks,
         "travel_time_between_sites_min": config.travel_time_between_sites_min,
+        "schedule_start_date": config.schedule_start_date,
+        "optimize_ob_cost": config.optimize_ob_cost,
+        # Generisk verksamhetstyp
+        "clinic_type": config.clinic_type,
+        "has_on_call": config.has_on_call,
+        "has_operations": config.has_operations,
+        "custom_roles": config.custom_roles,
+        "custom_functions": config.custom_functions,
     }
 
 
@@ -950,6 +1019,13 @@ def dict_to_config(data: dict) -> ClinicConfig:
         schedule_cycle_weeks=data.get("schedule_cycle_weeks", 10),
         travel_time_between_sites_min=data.get("travel_time_between_sites_min", 0),
         schedule_start_date=data.get("schedule_start_date", ""),
+        optimize_ob_cost=data.get("optimize_ob_cost", True),
+        # Generisk verksamhetstyp
+        clinic_type=data.get("clinic_type", "kirurgi"),
+        has_on_call=data.get("has_on_call", True),
+        has_operations=data.get("has_operations", True),
+        custom_roles=data.get("custom_roles", []),
+        custom_functions=data.get("custom_functions", []),
     )
 
 

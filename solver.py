@@ -95,49 +95,98 @@ def _ob_cost(weekday: int, func_id: str, ob_rates: OBRates) -> float:
 def _build_functions(config: ClinicConfig):
     """
     Bygg funktions-ID:n dynamiskt från klinikens konfiguration.
+    Stöder alla verksamhetstyper: kirurgi, vårdcentral, internmedicin, psykiatri etc.
 
     Returnerar:
         day_functions: [(func_id, Function, site_str), ...]
         call_functions: [(func_id, Function, site_str), ...]
         op_funcs_by_site: {site_str: func_id}
+        akut_sites: [site_str, ...]
     """
     day_functions = []
     op_funcs_by_site = {}
 
-    # En OP-funktion per site (aggregerar alla salar på den siten)
-    sites_with_rooms = sorted(set(r.site for r in config.operating_rooms))
-    for site in sites_with_rooms:
-        func_id = f"OP_{site}"
-        day_functions.append((func_id, Function.OPERATION, site))
-        op_funcs_by_site[site] = func_id
+    has_ops = getattr(config, 'has_operations', True)
+    has_call = getattr(config, 'has_on_call', True)
 
-    # En AVD och MOTT per site (från config.sites)
+    # === OP-funktioner (bara om kliniken har operationsverksamhet) ===
+    if has_ops and config.operating_rooms:
+        sites_with_rooms = sorted(set(r.site for r in config.operating_rooms))
+        for site in sites_with_rooms:
+            func_id = f"OP_{site}"
+            day_functions.append((func_id, Function.OPERATION, site))
+            op_funcs_by_site[site] = func_id
+
+    # === Standardfunktioner per site ===
     for site in config.sites:
-        day_functions.append((f"AVD_{site}", Function.AVDELNING, site))
+        # Alla verksamheter har mottagning
         day_functions.append((f"MOTT_{site}", Function.MOTTAGNING, site))
 
-    # AKUT per site (om StaffingRequirement finns för AKUT)
+    # AVD bara för slutenvårdskliniker
+    clinic_type = getattr(config, 'clinic_type', 'kirurgi')
+    if clinic_type in ('kirurgi', 'internmedicin', 'psykiatri', 'rehabilitering', 'annan'):
+        for site in config.sites:
+            day_functions.append((f"AVD_{site}", Function.AVDELNING, site))
+
+    # AKUT per site (bara om det finns staffing_requirements för AKUT)
     akut_sites = set()
     for req in getattr(config, 'staffing_requirements', []):
         if req.function == Function.AKUTMOTTAGNING:
             akut_sites.add(req.site)
-    if not akut_sites:
-        # Fallback: alla sites har akut
+    # Om det är en kirurgisk klinik och ingen AKUT-konfiguration finns: default alla sites
+    if not akut_sites and clinic_type == 'kirurgi':
         akut_sites = set(config.sites)
     for site in sorted(akut_sites):
         day_functions.append((f"AKUT_{site}", Function.AKUTMOTTAGNING, site))
 
-    # Icke-kliniska funktioner (ej site-specifika)
+    # === Verksamhetsspecifika funktioner ===
+    _CLINIC_TYPE_FUNCTIONS = {
+        "vardcentral": [
+            ("BVC", Function.BVC, None), ("MVC", Function.MVC, None),
+            ("LAB", Function.LAB, None), ("REHAB", Function.REHAB, None),
+            ("TELEFON", Function.TELEFONTID, None), ("HEMBESÖK", Function.HEMBESÖK, None),
+            ("VIDEO", Function.VIDEOMOTTAGNING, None),
+        ],
+        "internmedicin": [
+            ("ROND", Function.ROND, None), ("DIALYS", Function.DIALYS, None),
+            ("DAGVÅRD", Function.DAGVÅRD, None),
+        ],
+        "psykiatri": [
+            ("SAMTAL", Function.SAMTAL, None), ("GRUPP", Function.GRUPPTERAPI, None),
+            ("AKUTPSYK", Function.AKUTPSYK, None),
+        ],
+        "rehabilitering": [
+            ("REHAB", Function.REHAB, None),
+        ],
+    }
+    for func_tuple in _CLINIC_TYPE_FUNCTIONS.get(clinic_type, []):
+        day_functions.append(func_tuple)
+
+    # === Custom funktioner från config ===
+    for cf in getattr(config, 'custom_functions', []):
+        cf_id = cf.get('id', '')
+        if not cf_id:
+            continue
+        # Site-specifik eller global
+        if cf.get('site_specific', False):
+            for site in config.sites:
+                day_functions.append((f"{cf_id}_{site}", None, site))
+        else:
+            day_functions.append((cf_id, None, None))
+
+    # === Icke-kliniska funktioner (alla verksamheter) ===
     day_functions.append(("ADMIN", Function.ADMIN, None))
     day_functions.append(("FORSKNING", Function.FORSKNING, None))
     day_functions.append(("HANDLEDNING", Function.HANDLEDNING, None))
     day_functions.append(("UTBILDNING", Function.UTBILDNING, None))
 
-    # Jour (universella — inte site-specifika i modellen)
-    call_functions = [
-        ("JOUR_P", Function.PRIMÄRJOUR, None),
-        ("JOUR_B", Function.BAKJOUR, None),
-    ]
+    # === Jourfunktioner (bara om kliniken har jour) ===
+    call_functions = []
+    if has_call:
+        call_functions = [
+            ("JOUR_P", Function.PRIMÄRJOUR, None),
+            ("JOUR_B", Function.BAKJOUR, None),
+        ]
 
     return day_functions, call_functions, op_funcs_by_site, sorted(akut_sites)
 
@@ -291,63 +340,78 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
             if keys:
                 model.add(sum(x[k] for k in keys) >= 1)
 
-    # === CONSTRAINT 3: Jourlinjer (alla dagar) ===
-    primary_eligible = [d for d in config.doctors if d.can_primary_call]
-    backup_eligible = [d for d in config.doctors if d.can_backup_call and not d.exempt_from_call]
+    # === CONSTRAINT 3: Jourlinjer (alla dagar) — BARA om kliniken har jour ===
+    has_call = getattr(config, 'has_on_call', True)
+    primary_eligible = [d for d in config.doctors if d.can_primary_call] if has_call else []
+    backup_eligible = [d for d in config.doctors if d.can_backup_call and not d.exempt_from_call] if has_call else []
 
-    for day in range(num_days):
-        model.add(sum(x[(d.id, day, "JOUR_P")] for d in primary_eligible) == 1)
-        for d in config.doctors:
-            if not d.can_primary_call:
-                model.add(x[(d.id, day, "JOUR_P")] == 0)
+    if has_call and call_functions:
+        for day in range(num_days):
+            if primary_eligible:
+                model.add(sum(x[(d.id, day, "JOUR_P")] for d in primary_eligible) == 1)
+                for d in config.doctors:
+                    if not d.can_primary_call:
+                        model.add(x[(d.id, day, "JOUR_P")] == 0)
 
-        model.add(sum(x[(d.id, day, "JOUR_B")] for d in backup_eligible) == 1)
-        for d in config.doctors:
-            if not d.can_backup_call or d.exempt_from_call:
-                model.add(x[(d.id, day, "JOUR_B")] == 0)
+            if backup_eligible:
+                model.add(sum(x[(d.id, day, "JOUR_B")] for d in backup_eligible) == 1)
+                for d in config.doctors:
+                    if not d.can_backup_call or d.exempt_from_call:
+                        model.add(x[(d.id, day, "JOUR_B")] == 0)
 
-    # === CONSTRAINT 4: ATL — Vila efter jour ===
-    for doc in config.doctors:
-        for day in range(num_days - 1):
-            next_day = day + 1
-            weekday_next = next_day % 7
+    # === CONSTRAINT 4: ATL — Vila efter jour (bara om jour finns) ===
+    if has_call and call_functions:
+        for doc in config.doctors:
+            for day in range(num_days - 1):
+                next_day = day + 1
+                weekday_next = next_day % 7
 
-            for call_func_id in ["JOUR_P", "JOUR_B"]:
-                is_on_call = x.get((doc.id, day, call_func_id))
-                if is_on_call is not None and next_day < num_days:
-                    if weekday_next < 5:
-                        for func_id, _, _ in day_functions:
-                            if (doc.id, next_day, func_id) in x:
-                                model.add(x[(doc.id, next_day, func_id)] == 0).only_enforce_if(is_on_call)
+                for call_func_id in ["JOUR_P", "JOUR_B"]:
+                    is_on_call = x.get((doc.id, day, call_func_id))
+                    if is_on_call is not None and next_day < num_days:
+                        if weekday_next < 5:
+                            for func_id, _, _ in day_functions:
+                                if (doc.id, next_day, func_id) in x:
+                                    model.add(x[(doc.id, next_day, func_id)] == 0).only_enforce_if(is_on_call)
 
-    # === CONSTRAINT 5: Max jourer per vecka ===
-    for doc in config.doctors:
-        for week in range(num_weeks):
-            week_start = week * 7
-            week_calls = []
-            for day in range(week_start, min(week_start + 7, num_days)):
-                if (doc.id, day, "JOUR_P") in x:
-                    week_calls.append(x[(doc.id, day, "JOUR_P")])
-                if (doc.id, day, "JOUR_B") in x:
-                    week_calls.append(x[(doc.id, day, "JOUR_B")])
-            if week_calls:
-                model.add(sum(week_calls) <= 1)
+    # === CONSTRAINT 5: Max jourer per vecka (bara om jour finns) ===
+    # Styrs av constraint_rule "call_max_per_week" — default max 1 per vecka
+    call_max_rule = None
+    for rule in getattr(config, 'constraint_rules', []):
+        if rule.id == 'call_max_per_week' and rule.enabled:
+            call_max_rule = rule
+            break
+    max_calls_per_week = call_max_rule.parameters.get('max_calls', 1) if call_max_rule else 2
+
+    if has_call and call_functions:
+        for doc in config.doctors:
+            for week in range(num_weeks):
+                week_start = week * 7
+                week_calls = []
+                for day in range(week_start, min(week_start + 7, num_days)):
+                    if (doc.id, day, "JOUR_P") in x:
+                        week_calls.append(x[(doc.id, day, "JOUR_P")])
+                    if (doc.id, day, "JOUR_B") in x:
+                        week_calls.append(x[(doc.id, day, "JOUR_B")])
+                if week_calls:
+                    model.add(sum(week_calls) <= max_calls_per_week)
 
     # === CONSTRAINT 6: Helger ===
     for doc in config.doctors:
         for day in range(num_days):
             if day % 7 >= 5:
                 jour_vars = []
-                if (doc.id, day, "JOUR_P") in x:
-                    jour_vars.append(x[(doc.id, day, "JOUR_P")])
-                if (doc.id, day, "JOUR_B") in x:
-                    jour_vars.append(x[(doc.id, day, "JOUR_B")])
+                if has_call:
+                    if (doc.id, day, "JOUR_P") in x:
+                        jour_vars.append(x[(doc.id, day, "JOUR_P")])
+                    if (doc.id, day, "JOUR_B") in x:
+                        jour_vars.append(x[(doc.id, day, "JOUR_B")])
                 if (doc.id, day, "LEDIG") in x:
                     jour_vars.append(x[(doc.id, day, "LEDIG")])
                 if jour_vars:
                     model.add_exactly_one(jour_vars)
 
-    # === CONSTRAINT 7: OR-kapacitetstak per site ===
+    # === CONSTRAINT 7: OR-kapacitetstak per site (bara om OP finns) ===
     for day in range(num_days):
         weekday = day % 7
         if weekday >= 5:
@@ -424,54 +488,53 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
         if active_ol:
             model.add(sum(active_ol) >= 1)
 
-    # === CONSTRAINT 12: Helgkompensation ===
+    # === CONSTRAINT 12: Helgkompensation (bara om jour finns) ===
     # Primärjour helg → 1 ledig vardag veckan efter (hård)
     # Bakjour helg → 1 ledig vardag veckan efter (mjuk penalty)
     weekend_comp_penalties = []
 
-    for doc in config.doctors:
-        for week in range(num_weeks - 1):  # Sista veckan har ingen "veckan efter"
-            sat = week * 7 + 5
-            sun = week * 7 + 6
-            next_week_start = (week + 1) * 7
-            next_week_weekdays = [d for d in range(next_week_start, min(next_week_start + 5, num_days))]
+    if has_call and call_functions:
+        for doc in config.doctors:
+            for week in range(num_weeks - 1):
+                sat = week * 7 + 5
+                sun = week * 7 + 6
+                next_week_start = (week + 1) * 7
+                next_week_weekdays = [d for d in range(next_week_start, min(next_week_start + 5, num_days))]
 
-            if not next_week_weekdays:
-                continue
-
-            for call_type in ["JOUR_P", "JOUR_B"]:
-                is_primary = (call_type == "JOUR_P")
-                weekend_calls = []
-                for d in [sat, sun]:
-                    if d < num_days and (doc.id, d, call_type) in x:
-                        weekend_calls.append(x[(doc.id, d, call_type)])
-
-                if not weekend_calls:
+                if not next_week_weekdays:
                     continue
 
-                num_weekend_calls = model.new_int_var(0, 2, f"wc_{doc.id}_{week}_{call_type}")
-                model.add(num_weekend_calls == sum(weekend_calls))
+                for call_type in ["JOUR_P", "JOUR_B"]:
+                    is_primary = (call_type == "JOUR_P")
+                    weekend_calls = []
+                    for d in [sat, sun]:
+                        if d < num_days and (doc.id, d, call_type) in x:
+                            weekend_calls.append(x[(doc.id, d, call_type)])
 
-                next_week_ledig = []
-                for d in next_week_weekdays:
-                    if (doc.id, d, "LEDIG") in x:
-                        next_week_ledig.append(x[(doc.id, d, "LEDIG")])
+                    if not weekend_calls:
+                        continue
 
-                if not next_week_ledig:
-                    continue
+                    num_weekend_calls = model.new_int_var(0, 2, f"wc_{doc.id}_{week}_{call_type}")
+                    model.add(num_weekend_calls == sum(weekend_calls))
 
-                num_ledig = model.new_int_var(0, 5, f"wl_{doc.id}_{week}_{call_type}")
-                model.add(num_ledig == sum(next_week_ledig))
+                    next_week_ledig = []
+                    for d in next_week_weekdays:
+                        if (doc.id, d, "LEDIG") in x:
+                            next_week_ledig.append(x[(doc.id, d, "LEDIG")])
 
-                if is_primary and config.call_structure.weekend_comp_primary:
-                    # HÅRD: lediga vardagar >= helgjourdagar
-                    model.add(num_ledig >= num_weekend_calls)
-                elif not is_primary and config.call_structure.weekend_comp_backup:
-                    # MJUK: penalty om inte tillräckligt ledigt
-                    shortfall = model.new_int_var(0, 2, f"ws_{doc.id}_{week}")
-                    model.add(shortfall >= num_weekend_calls - num_ledig)
-                    model.add(shortfall >= 0)
-                    weekend_comp_penalties.append(shortfall)
+                    if not next_week_ledig:
+                        continue
+
+                    num_ledig = model.new_int_var(0, 5, f"wl_{doc.id}_{week}_{call_type}")
+                    model.add(num_ledig == sum(next_week_ledig))
+
+                    if is_primary and config.call_structure.weekend_comp_primary:
+                        model.add(num_ledig >= num_weekend_calls)
+                    elif not is_primary and config.call_structure.weekend_comp_backup:
+                        shortfall = model.new_int_var(0, 2, f"ws_{doc.id}_{week}")
+                        model.add(shortfall >= num_weekend_calls - num_ledig)
+                        model.add(shortfall >= 0)
+                        weekend_comp_penalties.append(shortfall)
 
     # === CONSTRAINT 13: Semesterblock ===
     locked_set = set()

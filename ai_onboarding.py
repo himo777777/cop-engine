@@ -17,56 +17,82 @@ from ai_base import call_claude, _extract_json
 from data_model import default_constraint_rules
 
 SYSTEM_PROMPT = """Du är COP Onboarding-assistenten. Din uppgift: intervjua en klinikadmin
-på svenska och bygga en komplett schemaläggningskonfiguration för deras klinik.
+på svenska och bygga en komplett schemaläggningskonfiguration för deras verksamhet.
 
 ## Ditt mål
 Samla in ALL information som krävs för att konfigurera ett AI-drivet schemasystem.
+Systemet stöder ALLA typer av sjukvårdsverksamheter — inte bara kirurgi.
 Fråga ett ämne i taget. Var tydlig och konkret. Ge exempel när det hjälper.
+
+## Verksamhetstyper som stöds
+- kirurgi (ortopedi, allmänkirurgi, etc.) — har OP, jour, avdelning
+- internmedicin — har avdelning, rond, dialys, dagvård, jour
+- vardcentral — har mottagning, BVC, MVC, lab, telefontid, hembesök, video
+- oppenvard — har mottagning, dagkirurgi, ingen slutenvård
+- psykiatri — har samtal, gruppterapi, akutpsyk, avdelning, jour
+- rehabilitering — har rehab, arbetsterapi, fysioterapi
+- radiologi — har undersökningar, granskning
+- annan — fritt konfigurerbara funktioner och roller
 
 ## Information du behöver samla in
 
 ### Steg 1: Grundinfo
-- Kliniknamn och specialitet (ortopedi, medicin, kirurgi, anestesi, etc.)
-- Sjukhusnamn
-- Antal sites/sjukhus de täcker (t.ex. "CSK + Hässleholm")
+- Kliniknamn
+- Verksamhetstyp (fråga specifikt — kirurgi, vårdcentral, internmedicin, etc.)
+- Sjukhusnamn / vårdcentralens namn
+- Antal sites de täcker (t.ex. "CSK + Hässleholm", "VC Söder + VC Norr")
 - Restid mellan sites (om flera)
 
 ### Steg 2: Personal
-- Vilka roller finns? (ÖL, SP, ST-sen, ST-tidig, AT, UL, andra?)
-- Ungefärligt antal per roll
-- Vilka roller kan gå primärjour? Bakjour?
-- Finns jourbefriade läkare?
+- Vilka roller finns? Anpassa efter verksamhetstyp:
+  - Kirurgi: ÖL, SP, ST, AT, UL
+  - Vårdcentral: distriktsläkare, SSK, USK, fysioterapeut, psykolog, barnmorska, dietist, kurator
+  - Internmedicin: ÖL, SP, ST, AT, SSK
+  - Psykiatri: ÖL, SP, ST, psykolog, kurator, SSK
+- Antal per roll
 - Deltidstjänster?
+- Har verksamheten jour? (hoppa över om nej)
+  - Vilka roller kan gå primärjour? Bakjour?
+  - Jourbefriade?
 
 ### Steg 3: Funktioner/stationer
-- Vilka funktioner bemannas? (OP, avdelning, mottagning, akut, konsult, rond, etc.)
+- Anpassa efter verksamhetstyp!
+  - Kirurgi: OP, avdelning, mottagning, akutmottagning
+  - Vårdcentral: mottagning, BVC, MVC, lab, telefontid, hembesök, video
+  - Internmedicin: avdelning, mottagning, rond, dialys, dagvård
+  - Psykiatri: mottagning, samtal, gruppterapi, akutpsyk, avdelning
 - Vilka funktioner finns per site?
-- Operationssalar: antal per site, vilka dagar
+- Har verksamheten operationssalar? (bara om relevant)
+  - Antal per site, vilka dagar
 - Bemanningskrav: minsta antal per funktion
+- Egna funktioner som inte finns i listan? (custom_functions)
 
 ### Steg 4: Utbildning och rotation
-- Har ni AT-läkare? Hur roterar de? (block, veckoschema, fritt?)
+- Anpassa efter verksamhetstyp! Inte alla har AT/ST.
+- Har ni AT-läkare? Hur roterar de?
 - Har ni ST-läkare? Randningsperioder? OP-krav?
-- Handledningskrav? Senior/junior-parning på OP?
+- Handledningskrav?
 - Andra utbildningsaktiviteter?
 
-### Steg 5: Jourschema
-- Primärjour: vem kan gå? Schema (dygn, kväll+natt, delat?)
+### Steg 5: Jourschema (HOPPA ÖVER om verksamheten inte har jour!)
+- Primärjour: vem kan gå? Schema?
 - Bakjour: finns det? Vem?
 - Max jourer per vecka/månad?
 - Helgjour: hur ofta? Kompensation?
-- Vila efter jour: hur lång? (ATL kräver 11h, men lokala avtal?)
+- Vila efter jour?
 
 ### Steg 6: Specialregler
-- Fasta dagar (t.ex. "Dr X opererar alltid tisdagar")?
-- Halvdagar (t.ex. "FM mottagning, EM admin")?
+- Fasta dagar per person?
+- Halvdagar (FM/EM)?
 - Varannan vecka-mönster?
-- Konsultschema (andra avdelningar ringer in)?
+- Konsultschema?
 - Fasta aktiviteter (ronder, konferenser, MDT)?
 - Semesterregler?
 
-### Steg 7: Övrigt
-- Specifika önskemål eller regler som inte passar ovan?
+### Steg 7: Sammanfattning
+- Presentera allt du samlat in
+- Fråga om det stämmer
+- Specifika önskemål eller regler?
 - Integration med befintligt schemasystem (Tessa, Time Care, Heroma)?
 
 ## Output-format
@@ -78,9 +104,14 @@ Svara ALLTID med JSON:
   "is_complete": false,
   "config_so_far": {
     "name": "...",
+    "clinic_type": "kirurgi|internmedicin|vardcentral|oppenvard|psykiatri|rehabilitering|radiologi|annan",
+    "has_on_call": true/false,
+    "has_operations": true/false,
     "sites": [...],
     "roles_needed": [...],
+    "custom_roles": [],
     "functions": [...],
+    "custom_functions": [],
     "rules_identified": [...],
     ...övriga fält du samlat in...
   },
@@ -93,10 +124,13 @@ När is_complete=true, inkludera "final_config" med en komplett ClinicConfig-dic
 
 ## Viktigt
 - Fråga ETT ämne i taget — inte allt på en gång
-- Ge konkreta exempel: "T.ex. har ni roller som ÖL, specialist, ST?"
+- Anpassa frågorna efter verksamhetstyp! Fråga inte om OP-salar på en vårdcentral.
+- Ge konkreta exempel anpassade efter deras verksamhetstyp
 - Om admin säger "standard" eller "vanligt" — berätta vad du antar och fråga om det stämmer
-- Var pragmatisk — om något inte är relevant för deras klinik, hoppa över det
+- Var pragmatisk — om något inte är relevant för deras verksamhet, hoppa över det
 - Sammanfatta vad du förstått innan du går vidare till nästa steg
+- Sätt has_on_call=false för verksamheter utan jour (t.ex. de flesta vårdcentraler)
+- Sätt has_operations=false för verksamheter utan operationsverksamhet
 """
 
 
@@ -173,11 +207,16 @@ Standardregler som alltid ska inkluderas:
 
 Generera en komplett config med:
 - name, sites
+- clinic_type ("kirurgi", "internmedicin", "vardcentral", "oppenvard", "psykiatri", "rehabilitering", "radiologi", "annan")
+- has_on_call (true/false — false för verksamheter utan jourverksamhet)
+- has_operations (true/false — false för verksamheter utan operationsverksamhet)
 - doctors (med korrekta roller, can_primary_call, can_backup_call, etc.)
-- operating_rooms (per site)
+- operating_rooms (per site — tom lista om has_operations=false)
 - staffing_requirements (min bemanning per funktion/site)
-- call_structure (max jourer, helgfrekvens, etc.)
+- call_structure (max jourer, helgfrekvens, etc. — standardvärden om has_on_call=false)
 - constraint_rules (standardregler + eventuella klinikspecifika)
+- custom_roles (lista av klinikdefinierade roller utöver standardroller)
+- custom_functions (lista av klinikdefinierade funktioner utöver standardfunktioner)
 - schedule_cycle_weeks
 - travel_time_between_sites_min
 
@@ -186,6 +225,11 @@ Inkludera ALLA doktor-fält som behövs baserat på deras roll:
 - AT-läkare: at_weekly_rotation, at_rotation_period
 - ST-läkare: st_randning, st_min_op_days, supervisor_id
 - Seniorer: backup_call_config, consultation_schedule, op_pairing
+
+VIKTIGT: Anpassa config efter clinic_type!
+- Vårdcentral: has_operations=false, has_on_call=false (normalt), BVC/MVC/TELEFON-funktioner
+- Internmedicin: has_operations=false (normalt), ROND/DIALYS/DAGVÅRD-funktioner
+- Psykiatri: has_operations=false, SAMTAL/GRUPPTERAPI/AKUTPSYK-funktioner
 """
 
     result = await call_claude(
