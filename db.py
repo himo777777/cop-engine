@@ -242,6 +242,24 @@ async def connect_db():
             except Exception as drop_err:
                 logger.warning("Kunde inte droppa password_hash: %s", drop_err)
 
+            # Drop old jobs table columns — old schema had params/result/status/updated_at
+            # which may have NOT NULL constraints blocking inserts into the new schema.
+            for _old_col in ["params", "result", "status", "updated_at"]:
+                try:
+                    await mig_conn.execute(
+                        f"ALTER TABLE jobs DROP COLUMN IF EXISTS {_old_col};"
+                    )
+                except Exception as _col_err:
+                    logger.warning("Kunde inte droppa jobs.%s: %s", _old_col, _col_err)
+            # Ensure jobs.data column exists (may be missing if table predates migration)
+            try:
+                await mig_conn.execute(
+                    "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS data JSONB;"
+                )
+            except Exception as _col_err:
+                logger.warning("Kunde inte lägga till jobs.data: %s", _col_err)
+            print("[DB] jobs table schema ensured")
+
         # Verify via information_schema which columns actually exist.
         # If any required users columns are missing, drop and recreate the table.
         # Safe because default users are always regenerated at startup anyway.
