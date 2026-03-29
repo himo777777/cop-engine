@@ -436,10 +436,16 @@ async def init_auth(db) -> None:
             hashed_password=hash_password(pwd),
             password_change_required=True,
         )
-        await db.save_user(user.model_dump())
-        _cache_set(user)
+        try:
+            await db.save_user(user.model_dump())
+            _cache_set(user)
+        except Exception as e:
+            logger.warning(f"Kunde inte spara default-user {uid}: {e} — appen startar ändå")
 
-    await db.cleanup_expired_tokens()
+    try:
+        await db.cleanup_expired_tokens()
+    except Exception as e:
+        logger.warning(f"cleanup_expired_tokens misslyckades: {e}")
 
 
 # ---------------------------------------------------------------------------
