@@ -232,6 +232,15 @@ async def connect_db():
                     )
                 except Exception as col_err:
                     logger.warning("Kolumn-migration %s.%s: %s", tbl, col, col_err)
+            # Drop the legacy password_hash column — it was renamed to hashed_password.
+            # Having both columns causes NOT NULL violations in INSERT statements.
+            try:
+                await mig_conn.execute(
+                    "ALTER TABLE users DROP COLUMN IF EXISTS password_hash;"
+                )
+                print("[DB] Legacy password_hash column dropped (if it existed)")
+            except Exception as drop_err:
+                logger.warning("Kunde inte droppa password_hash: %s", drop_err)
 
         # Verify via information_schema which columns actually exist.
         # If any required users columns are missing, drop and recreate the table.
