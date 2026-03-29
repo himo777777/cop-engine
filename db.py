@@ -209,6 +209,30 @@ async def connect_db():
             logger.warning("Schema-migration timeout (30s) — appen fortsätter utan migration")
         except Exception as schema_err:
             logger.warning("Schema-migration hade problem (appen fortsätter): %s", schema_err)
+
+        # Run critical column migrations as individual statements so they can't be
+        # silently swallowed by a DO-block EXCEPTION WHEN OTHERS handler.
+        # This guarantees users table has all required columns even on old schemas.
+        _CRITICAL_COLUMN_MIGRATIONS = [
+            ("users", "email",                    "TEXT"),
+            ("users", "full_name",                "TEXT"),
+            ("users", "role",                     "TEXT DEFAULT 'viewer'"),
+            ("users", "doctor_id",                "TEXT"),
+            ("users", "hashed_password",          "TEXT DEFAULT ''"),
+            ("users", "is_active",                "BOOLEAN DEFAULT TRUE"),
+            ("users", "created_at",               "TIMESTAMPTZ DEFAULT NOW()"),
+            ("users", "last_login",               "TIMESTAMPTZ"),
+            ("users", "password_change_required", "BOOLEAN DEFAULT FALSE"),
+        ]
+        async with _pool.acquire() as mig_conn:
+            for tbl, col, typedef in _CRITICAL_COLUMN_MIGRATIONS:
+                try:
+                    await mig_conn.execute(
+                        f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS {col} {typedef}"
+                    )
+                except Exception as col_err:
+                    logger.warning("Kolumn-migration %s.%s: %s", tbl, col, col_err)
+
         return True
     except asyncio.TimeoutError:
         logger.error("PostgreSQL pool creation timeout (20s) — faller tillbaka till in-memory")

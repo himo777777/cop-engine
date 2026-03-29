@@ -439,13 +439,21 @@ async def init_auth(db) -> None:
         try:
             await db.save_user(user.model_dump())
             _cache_set(user)
+            print(f"[COP AUTH] Skapade default-user: {uname}")
         except Exception as e:
-            logger.warning(f"Kunde inte spara default-user {uid}: {e} — appen startar ändå")
+            # logger is not available here — use print so startup never crashes
+            print(f"[COP AUTH] Kunde inte spara default-user {uid}: {e} — fortsätter ändå")
+            # Still cache the user so login works even if DB save failed
+            try:
+                _cache_set(user)
+                print(f"[COP AUTH] {uname} cachad i minnet (DB-spara misslyckades)")
+            except Exception as cache_err:
+                print(f"[COP AUTH] Cache misslyckades för {uid}: {cache_err}")
 
     try:
         await db.cleanup_expired_tokens()
     except Exception as e:
-        logger.warning(f"cleanup_expired_tokens misslyckades: {e}")
+        print(f"[COP AUTH] cleanup_expired_tokens misslyckades: {e}")
 
 
 # ---------------------------------------------------------------------------
