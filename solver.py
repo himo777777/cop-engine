@@ -1086,19 +1086,16 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
                 if site == doc.site_preference and (doc.id, day, func_id) in x:
                     site_pref_bonus.append(x[(doc.id, day, func_id)])
 
-    # === OBJEKTIV FUNKTION (vikter från config.constraint_rules) ===
-    w_training = _rule_weight(config, "training_st_supervisor", 6)
+    # === OBJEKTIV FUNKTION ===
+    # Klinikbreda vikter (togglebara via admin)
     w_fairness = _rule_weight(config, "call_fairness", 5)
     w_rest = _rule_weight(config, "atl_weekly_rest", 8)
     w_weekend = _rule_weight(config, "call_weekend_frequency", 5)
-    w_site = _rule_weight(config, "preference_site", 3)
     w_comp = _rule_weight(config, "weekend_compensation", 7)
 
     objective_terms = []
-    for bonus_var in st_training_bonus:
-        objective_terms.append(w_training * bonus_var)
-    for pref_term in preference_bonus:
-        objective_terms.append(pref_term)
+
+    # --- Klinikbreda mjuka constraints ---
     if call_counts and w_fairness:
         call_spread = model.new_int_var(0, num_days, "call_spread")
         model.add(call_spread == max_calls - min_calls)
@@ -1107,24 +1104,33 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
         objective_terms.append(w_rest * rest_var)
     for wknd_var in weekend_penalties:
         objective_terms.append(-w_weekend * wknd_var)
-    for sp_var in site_pref_bonus:
-        objective_terms.append(w_site * sp_var)
-    # Helgkompensation bakjour (mjuk penalty)
     for penalty in weekend_comp_penalties:
         objective_terms.append(-w_comp * penalty)
-    # Semesterblock (mjuka önskemål)
+
+    # --- Per-läkare solverkunskap (fasta vikter, alltid aktiv) ---
+    # ST-handledning: maximera OP-dagar med handledare
+    for bonus_var in st_training_bonus:
+        objective_terms.append(12 * bonus_var)
+    # Önskemål
+    for pref_term in preference_bonus:
+        objective_terms.append(pref_term)
+    # Semesterblock
     for sv in semester_bonus:
         objective_terms.append(3 * sv)
-    # ST OP-krav: penalize deficit of OP days
-    w_st_op = _rule_weight(config, "st_op_requirement", 5)
+    # Site-preferens
+    for sp_var in site_pref_bonus:
+        objective_terms.append(6 * sp_var)
+    # ST OP-krav: penalty för deficit
     for deficit_var in st_op_penalty:
-        objective_terms.append(-w_st_op * deficit_var)
-    # Konsultschema (inbyggd kunskap): penalty för missade konsulttider
+        objective_terms.append(-10 * deficit_var)
+    # Konsultschema: penalty för missade konsulttider
     for cv in consult_penalty:
-        objective_terms.append(-12 * cv)  # Fast vikt — inte togglebar
-    # Senior/junior OP-par är nu hard constraint — ingen mjuk penalty behövs
+        objective_terms.append(-12 * cv)
+    # Kontinuitet (COC): straffa glapp i mottagningsdagar
+    if coc_penalty_terms:
+        objective_terms.append(-6 * sum(coc_penalty_terms))
 
-    # OB-kostnadsrättvisa
+    # --- OB-kostnadsrättvisa (klinikbred, togglebar) ---
     if config.optimize_ob_cost:
         ob_counts = {}
         for doc in config.doctors:
@@ -1148,17 +1154,11 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
                 model.add(min_ob <= ob_var)
             ob_spread = model.new_int_var(0, num_days * 40, "ob_spread")
             model.add(ob_spread == max_ob - min_ob)
-
             w_ob = _rule_weight(config, "ob_cost_fairness", 4)
             objective_terms.append(-w_ob * ob_spread)
 
-    # Lägg till regelmotor-termer
+    # Regelmotor-termer
     objective_terms.extend(rule_objective_terms)
-
-    # COC-penalty (Constraint 24): Straffa glapp i mottagningsdagar
-    if coc_penalty_terms:
-        w_coc = _rule_weight(config, "continuity_of_care", 3)
-        objective_terms.append(-w_coc * sum(coc_penalty_terms))
 
     if objective_terms:
         model.maximize(sum(objective_terms))

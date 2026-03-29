@@ -267,70 +267,60 @@ class ConstraintRule:
     weight: int = 5        # 1-10 (bara relevant för mjuka)
     enabled: bool = True
     parameters: dict = field(default_factory=dict)
+    description: str = ""
 
 
 def default_constraint_rules() -> list[ConstraintRule]:
-    """Standardregler för nya kliniker."""
+    """
+    Klinikbreda regler som admin kan slå av/på och vikta.
+    Dessa gäller HELA kliniken — lag, policy, bemanning.
+
+    PER-LÄKARE-KUNSKAP (alltid aktiv, styrs av Doctor-fält):
+      - Varannan vecka (schedule_pattern)
+      - Fasta veckodagar (fixed_weekdays)
+      - Min/max passtyp (min/max_shifts_per_week)
+      - Halvdagar (half_day_schedule)
+      - AT-block (current_rotation_block)
+      - AT-rotation (at_weekly_rotation)
+      - ST OP-krav (st_min_op_days)
+      - ST-handledning (supervisor_id)
+      - Återkommande aktiviteter (recurring_activities)
+      - Konsultschema (consultation_schedule)
+      - Bakjourslinje (backup_call_config)
+      - Senior/junior OP-par (op_pairing)
+      - Kontinuitet (MOTT-dagar grupperas per läkare)
+      - Site-preferens (site_preference)
+    """
     return [
+        # === LAG (ATL — Arbetstidslagen) ===
         ConstraintRule("atl_daily_rest", "11h dygnsvila efter jour", "atl",
                        is_hard=True, weight=10, parameters={"min_hours": 11}),
         ConstraintRule("atl_weekly_rest", "36h sammanhängande veckovila", "atl",
                        is_hard=False, weight=8, parameters={"min_hours": 36}),
         ConstraintRule("atl_max_weekly_hours", "Max 48h arbete per vecka", "atl",
                        is_hard=False, weight=7, parameters={"max_hours": 48}),
-        ConstraintRule("call_max_per_week", "Max 1 jour per vecka", "staffing",
-                       is_hard=True, weight=10, parameters={"max_calls": 1}),
-        ConstraintRule("call_weekend_frequency", "Max var 4:e helg med jour", "fairness",
-                       is_hard=False, weight=5, parameters={"min_interval_weeks": 4}),
-        ConstraintRule("staffing_senior_presence", "Minst 1 ÖL aktiv per vardag", "staffing",
-                       is_hard=True, weight=10, parameters={"min_count": 1}),
-        ConstraintRule("training_st_supervisor", "ST med handledare på OP", "preference",
-                       is_hard=False, weight=6, parameters={}),
-        ConstraintRule("call_fairness", "Rättvis jourfördelning", "fairness",
-                       is_hard=False, weight=5, parameters={}),
-        ConstraintRule("preference_site", "Respektera site-preferens", "preference",
-                       is_hard=False, weight=3, parameters={}),
         ConstraintRule("max_workdays", "Max 5 arbetsdagar per vecka", "atl",
                        is_hard=True, weight=10, parameters={"max_days": 5}),
+        # === BEMANNING (klinikpolicy) ===
+        ConstraintRule("call_max_per_week", "Max 1 jour per vecka", "staffing",
+                       is_hard=True, weight=10, parameters={"max_calls": 1}),
+        ConstraintRule("staffing_senior_presence", "Minst 1 ÖL aktiv per vardag", "staffing",
+                       is_hard=True, weight=10, parameters={"min_count": 1}),
+        ConstraintRule("akut_staffing", "AKUT-bemanning dagtid", "staffing",
+                       is_hard=True, weight=10, parameters={"min_count": 3}),
+        ConstraintRule("min_senior_coverage", "Minimum seniorbeläggning per vecka", "staffing",
+                       is_hard=True, weight=10,
+                       description="Minst 50% av seniora läkare (ÖL + SP) måste vara schemalagda varje vecka"),
+        # === RÄTTVISA (klinikpolicy) ===
+        ConstraintRule("call_fairness", "Rättvis jourfördelning", "fairness",
+                       is_hard=False, weight=5, parameters={}),
+        ConstraintRule("call_weekend_frequency", "Max var 4:e helg med jour", "fairness",
+                       is_hard=False, weight=5, parameters={"min_interval_weeks": 4}),
         ConstraintRule("weekend_compensation", "Ledig vardag efter helgjour", "fairness",
                        is_hard=False, weight=7, parameters={}),
         ConstraintRule("ob_cost_fairness", "Rättvis OB-fördelning", "fairness",
                        is_hard=False, weight=4, parameters={}),
-        # === NYA CONSTRAINTS (Fas 1 expansion) ===
-        ConstraintRule("biweekly_pattern", "Varannan-vecka-schema", "staffing",
-                       is_hard=True, weight=10, parameters={}),
-        ConstraintRule("min_shift_types", "Min passtyp per läkare/vecka", "staffing",
-                       is_hard=False, weight=7, parameters={}),
-        ConstraintRule("fixed_weekdays", "Fasta veckodagar per läkare", "staffing",
-                       is_hard=True, weight=10, parameters={}),
-        ConstraintRule("half_day_support", "Halvdagsschema AM/PM", "staffing",
-                       is_hard=True, weight=10, parameters={}),
-        ConstraintRule("st_supervisor_pairing", "ST med handledare på OP", "staffing",
-                       is_hard=False, weight=8, parameters={}),
-        ConstraintRule("at_block_rotation", "AT-block rotation (ej daglig)", "staffing",
-                       is_hard=True, weight=10, parameters={}),
-        ConstraintRule("akut_staffing", "AKUT-bemanning dagtid", "staffing",
-                       is_hard=True, weight=10, parameters={"min_count": 3}),
-        ConstraintRule("recurring_activities", "Fasta ronder/konferenser", "preference",
-                       is_hard=False, weight=6, parameters={}),
-        ConstraintRule("weekend_comp_auto", "Auto-kompledighet efter helgjour", "fairness",
-                       is_hard=False, weight=7, parameters={"comp_day_offset": 1}),
-        ConstraintRule("min_senior_coverage", "Minimum seniorbeläggning per vecka", "staffing",
-                       is_hard=True, weight=10,
-                       description="Minst 50% av seniora läkare (ÖL + SP) måste vara schemalagda varje vecka"),
-        ConstraintRule("continuity_of_care", "Kontinuitetskrav (COC)", "quality",
-                       is_hard=False, weight=3,
-                       description="Gruppera mottagningsdagar (MOTT) konsekutivt per läkare per vecka — undviker glapp"),
-        ConstraintRule("at_weekly_rotation", "AT-rotation veckoschema", "staffing",
-                       is_hard=True, weight=10,
-                       description="AT-läkare placeras enligt fast veckoschema: t.ex. 1 dag trauma, 2 dagar akut, 1 dag mott"),
-        ConstraintRule("st_op_requirement", "ST minsta OP-dagar/vecka", "fairness",
-                       is_hard=False, weight=5,
-                       description="ST-läkare garanteras konfigurerat minimiantal OP-dagar per vecka för utbildningsmål"),
     ]
-    # OBS: Bakjourslinje, konsultschema och senior/junior OP-parning är INTE
-    # togglebara klinik-regler. De är inbyggd solver-kunskap som alltid är aktiv
-    # och styrs per läkare via Doctor-fälten backup_call_config, consultation_schedule, op_pairing.
 
 
 @dataclass
