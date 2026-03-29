@@ -685,6 +685,33 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
                 if day_idx < num_days and (doc.id, day_idx, am_func) in x:
                     model.add(x[(doc.id, day_idx, am_func)] == 1)
 
+    # === CONSTRAINT 23: Minst 50% seniora läkare (ÖL + SP) per vecka ===
+    senior_docs = [doc for doc in config.doctors if doc.role.value in ("ÖL", "SP")]
+    total_seniors = len(senior_docs)
+    min_senior_per_week = max(1, math.ceil(total_seniors * 0.5))
+
+    for week in range(num_weeks):
+        week_senior_work = []
+        for doc in senior_docs:
+            pattern = getattr(doc, 'schedule_pattern', 'weekly')
+            # Skip off-weeks for biweekly
+            if pattern == 'biweekly_even' and week % 2 == 1:
+                continue
+            if pattern == 'biweekly_odd' and week % 2 == 0:
+                continue
+            # Count work days (non-LEDIG) for this senior in this week
+            for d_offset in range(5):  # Mon-Fri
+                day = week * 7 + d_offset
+                if day >= num_days:
+                    break
+                for f in day_functions:
+                    if (doc.id, day, f) in x:
+                        week_senior_work.append(x[(doc.id, day, f)])
+
+        # At least min_senior_per_week seniors should work in this week
+        if week_senior_work:
+            model.add(sum(week_senior_work) >= min_senior_per_week)
+
     # === DETAILED RULES (avancerad regelmotor) ===
     rule_objective_terms = []
     if getattr(config, 'detailed_rules', None):

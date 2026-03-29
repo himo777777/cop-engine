@@ -283,6 +283,9 @@ def default_constraint_rules() -> list[ConstraintRule]:
                        is_hard=False, weight=6, parameters={}),
         ConstraintRule("weekend_comp_auto", "Auto-kompledighet efter helgjour", "fairness",
                        is_hard=False, weight=7, parameters={"comp_day_offset": 1}),
+        ConstraintRule("min_senior_coverage", "Minimum seniorbeläggning per vecka", "staffing",
+                       is_hard=True, weight=10,
+                       description="Minst 50% av seniora läkare (ÖL + SP) måste vara schemalagda varje vecka"),
     ]
 
 
