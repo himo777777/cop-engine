@@ -276,34 +276,6 @@ async def shutdown():
 
 # === HEALTH & INFO ===
 
-@app.get("/debug/db", tags=["System"])
-async def debug_db():
-    """Temporärt debug-endpoint — visar DB-status och users-innehåll."""
-    import db as db_module
-    result = {"use_memory": db_module._use_memory, "pool_exists": db_module._pool is not None}
-    try:
-        async with db_module._pool.acquire() as conn:
-            users = await conn.fetch("SELECT user_id, username, role, length(hashed_password) as pw_len FROM users")
-            result["users"] = [dict(u) for u in users]
-            result["users_count"] = len(users)
-            # Try a test save_user to catch the actual error
-            try:
-                import hashlib, secrets as sec
-                salt = sec.token_hex(8)
-                h = hashlib.pbkdf2_hmac("sha256", b"test", salt.encode(), 1000)
-                test_hash = f"{salt}${h.hex()}"
-                await conn.execute(
-                    "INSERT INTO users (user_id,username,email,full_name,role,hashed_password,is_active,password_change_required) "
-                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (user_id) DO UPDATE SET hashed_password=EXCLUDED.hashed_password",
-                    "debug_test","debug_test","d@d.com","Debug",str("viewer"),test_hash,True,False)
-                result["test_insert"] = "OK"
-                await conn.execute("DELETE FROM users WHERE user_id='debug_test'")
-            except Exception as ins_err:
-                result["test_insert_error"] = f"{type(ins_err).__name__}: {ins_err}"
-    except Exception as e:
-        result["error"] = f"{type(e).__name__}: {e}"
-    return result
-
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 async def health_check():
