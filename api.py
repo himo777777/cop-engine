@@ -345,6 +345,100 @@ async def get_config_by_id(clinic_id: str):
     return result
 
 
+@app.get("/clinic/{clinic_id}/ui-config", tags=["Konfiguration"])
+async def get_ui_config(clinic_id: str):
+    """
+    Returnerar dynamisk UI-konfiguration för frontend.
+    Allt som frontend behöver för dropdowns, etiketter och formulär.
+    Drivs av klinikens faktiska config — inga hardkodade värden i frontend.
+    """
+    config = await db.get_config(clinic_id)
+    if not config:
+        raise HTTPException(status_code=404, detail=f"Klinik '{clinic_id}' finns inte")
+
+    from data_model import Role, Function
+
+    # Tillgängliga sites
+    sites = config.sites or []
+
+    # Roller som finns i kliniken (baserat på faktiska läkare)
+    active_roles = sorted(set(d.role.value for d in config.doctors))
+    role_labels = {
+        "AT": "AT-läkare", "UL": "Underläkare",
+        "ST_TIDIG": "ST-läkare (tidig)", "ST_SEN": "ST-läkare (senior)",
+        "SP": "Specialist", "ÖL": "Överläkare",
+    }
+    roles = [{"value": r, "label": role_labels.get(r, r)} for r in active_roles]
+    # Inkludera alla roller (för att kunna lägga till nya läkare)
+    all_roles = [{"value": r.value, "label": role_labels.get(r.value, r.value)} for r in Role]
+
+    # Funktioner — bygg dynamiskt från sites + operationssalar
+    day_functions = []
+    for site in sites:
+        day_functions.append({"value": f"OP_{site}", "label": f"OP {site}", "category": "operation", "site": site})
+        day_functions.append({"value": f"AVD_{site}", "label": f"Avdelning {site}", "category": "vård", "site": site})
+        day_functions.append({"value": f"MOTT_{site}", "label": f"Mottagning {site}", "category": "mottagning", "site": site})
+        day_functions.append({"value": f"AKUT_{site}", "label": f"Akut {site}", "category": "akut", "site": site})
+    # Icke-platsspecifika
+    day_functions.extend([
+        {"value": "ADMIN", "label": "Admin", "category": "admin", "site": None},
+        {"value": "FORSKNING", "label": "Forskning", "category": "admin", "site": None},
+        {"value": "HANDLEDNING", "label": "Handledning", "category": "utbildning", "site": None},
+        {"value": "UTBILDNING", "label": "Utbildning", "category": "utbildning", "site": None},
+        {"value": "LEDIG", "label": "Ledig", "category": "frånvaro", "site": None},
+    ])
+
+    # Operationssalar
+    rooms = [{"id": r.id, "site": r.site, "name": r.name,
+              "available_days": r.available_days} for r in config.operating_rooms]
+
+    # Jourlinjer
+    call_functions = [
+        {"value": "JOUR_P", "label": "Primärjour"},
+        {"value": "JOUR_B", "label": "Bakjour"},
+    ]
+
+    # Skifttyper (dag, kväll, natt, helg)
+    shift_types = [
+        {"value": "DAG", "label": "Dag (07-16:30)"},
+        {"value": "JOUR_KVÄLL", "label": "Kvällsjour (16:30-22)"},
+        {"value": "JOUR_NATT", "label": "Nattjour (22-07)"},
+        {"value": "JOUR_HELGDAG", "label": "Helgdag (07-22)"},
+        {"value": "JOUR_HELGNATT", "label": "Helgnatt (22-07)"},
+    ]
+
+    # Bemanningskrav
+    staffing = [{"function": sr.function.value, "site": sr.site,
+                 "min_count": sr.min_count, "shift_type": sr.shift_type.value}
+                for sr in config.staffing_requirements]
+
+    # Kompetenser (unika från befintliga läkare)
+    all_competencies = sorted(set(c for d in config.doctors for c in getattr(d, 'competencies', [])))
+
+    # Randningskliniker (unika från ST-läkare)
+    randning_kliniker = sorted(set(
+        r.get('klinik', '') for d in config.doctors
+        for r in getattr(d, 'st_randning', []) if r.get('klinik')
+    ))
+
+    return {
+        "clinic_id": clinic_id,
+        "clinic_name": config.name,
+        "sites": sites,
+        "roles": roles,
+        "all_roles": all_roles,
+        "day_functions": day_functions,
+        "call_functions": call_functions,
+        "shift_types": shift_types,
+        "operating_rooms": rooms,
+        "staffing_requirements": staffing,
+        "competencies": all_competencies,
+        "randning_kliniker": randning_kliniker,
+        "schedule_cycle_weeks": config.schedule_cycle_weeks,
+        "travel_time_between_sites_min": config.travel_time_between_sites_min,
+    }
+
+
 # === CONFIG CRUD ===
 
 class ClinicConfigInput(BaseModel):
