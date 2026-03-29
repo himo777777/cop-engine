@@ -45,9 +45,14 @@ class Function(Enum):
     JOUR_P_HELGNATT = "JOUR_P_HELGNATT"  # Primärjour helgnatt 22:00-07:00
     JOUR_B_HELGDAG = "JOUR_B_HELGDAG"    # Bakjour helgdag
     JOUR_B_HELGNATT = "JOUR_B_HELGNATT"  # Bakjour helgnatt
-    ADMIN = "ADMIN"            # MDT, rond, utbildning
+    ADMIN = "ADMIN"            # MDT, rond, administration
+    FORSKNING = "FORSKNING"    # Forskningsdagar
+    HANDLEDNING = "HANDLEDNING"  # ST-handledning, AT-handledning
+    UTBILDNING = "UTBILDNING"  # Kurser, konferenser, intern utbildning
+    AKUT = "AKUT"              # Akutmottagningspass (dagtid)
     LEDIG = "LEDIG"
     SEMESTER = "SEMESTER"
+    KOMPLEDIGHET = "KOMPLEDIGHET"  # Kompensationsledighet efter helgjour
 
 
 # Site is now a plain string, not an enum.
@@ -72,6 +77,36 @@ class Doctor:
     # ST-specifika fält
     required_procedures: dict[str, int] = field(default_factory=dict)
     completed_procedures: dict[str, int] = field(default_factory=dict)
+
+    # === AVANCERAD SCHEMALÄGGNING ===
+
+    # Varannan vecka — "biweekly_even" = jämna veckor, "biweekly_odd" = udda, "weekly" = varje vecka
+    schedule_pattern: str = "weekly"
+
+    # Fasta veckodagar: {"monday": "OP_CSK", "wednesday": "MOTT_Hässleholm", "friday": "FORSKNING"}
+    # Tom dict = inga fasta dagar (solvern väljer fritt)
+    fixed_weekdays: dict = field(default_factory=dict)
+
+    # Min passtyp per vecka: {"OP": 1, "MOTT": 1} = minst 1 OP + 1 MOTT per arbetsvecka
+    min_shifts_per_week: dict = field(default_factory=dict)
+
+    # Max passtyp per vecka: {"OP": 3} = högst 3 OP-dagar
+    max_shifts_per_week: dict = field(default_factory=dict)
+
+    # Halvdagar: {"monday": {"am": "ADMIN", "pm": "MOTT_CSK"}} — sub-dag-granularitet
+    # Om en dag har halvdagsschema, överrider den dagtilldelningen
+    half_day_schedule: dict = field(default_factory=dict)
+
+    # AT-block: AT-läkare roterar i block, inte dagligen
+    # {"block_type": "AVD_CSK", "start_date": "2026-04-01", "end_date": "2026-06-30"}
+    current_rotation_block: dict = field(default_factory=dict)
+
+    # Fasta återkommande aktiviteter: [{"weekday": "tuesday", "time": "10:00-11:00", "activity": "Infektionsrond"}]
+    recurring_activities: list = field(default_factory=list)
+
+    # Dagar per vecka (explicit, annars beräknas från employment_rate)
+    # T.ex. 3 = exakt 3 arbetsdagar per vecka (solvern respekterar detta)
+    work_days_per_week: Optional[int] = None
 
 
 @dataclass
@@ -126,6 +161,18 @@ def is_jour(func_id: str) -> bool:
     return func_id in JOUR_FUNC_IDS
 
 
+# Icke-kliniska funktioner (behöver inte bemanningskrav)
+NON_CLINICAL_FUNC_IDS = frozenset({
+    "ADMIN", "FORSKNING", "HANDLEDNING", "UTBILDNING",
+    "LEDIG", "SEMESTER", "KOMPLEDIGHET",
+})
+
+
+def is_non_clinical(func_id: str) -> bool:
+    """Returnerar True om func_id är icke-klinisk (admin/forskning/ledig etc)."""
+    return func_id in NON_CLINICAL_FUNC_IDS
+
+
 @dataclass
 class ATLRules:
     """Arbetstidslagens regler — hårda constraints."""
@@ -173,6 +220,9 @@ class ShiftDefinition:
     required_roles: list[Role] = field(default_factory=list)
     required_competencies: list[str] = field(default_factory=list)
     is_on_call: bool = False
+    is_half_day: bool = False          # True = halvdagspass (AM eller PM)
+    half_day_period: str = ""          # "am" eller "pm" — bara relevant om is_half_day=True
+    allows_recurring_activity: bool = True  # Kan ha inbäddade aktiviteter (ronder etc)
 
 
 @dataclass
@@ -214,6 +264,25 @@ def default_constraint_rules() -> list[ConstraintRule]:
                        is_hard=False, weight=7, parameters={}),
         ConstraintRule("ob_cost_fairness", "Rättvis OB-fördelning", "fairness",
                        is_hard=False, weight=4, parameters={}),
+        # === NYA CONSTRAINTS (Fas 1 expansion) ===
+        ConstraintRule("biweekly_pattern", "Varannan-vecka-schema", "staffing",
+                       is_hard=True, weight=10, parameters={}),
+        ConstraintRule("min_shift_types", "Min passtyp per läkare/vecka", "staffing",
+                       is_hard=False, weight=7, parameters={}),
+        ConstraintRule("fixed_weekdays", "Fasta veckodagar per läkare", "staffing",
+                       is_hard=True, weight=10, parameters={}),
+        ConstraintRule("half_day_support", "Halvdagsschema AM/PM", "staffing",
+                       is_hard=True, weight=10, parameters={}),
+        ConstraintRule("st_supervisor_pairing", "ST med handledare på OP", "staffing",
+                       is_hard=False, weight=8, parameters={}),
+        ConstraintRule("at_block_rotation", "AT-block rotation (ej daglig)", "staffing",
+                       is_hard=True, weight=10, parameters={}),
+        ConstraintRule("akut_staffing", "AKUT-bemanning dagtid", "staffing",
+                       is_hard=True, weight=10, parameters={"min_count": 3}),
+        ConstraintRule("recurring_activities", "Fasta ronder/konferenser", "preference",
+                       is_hard=False, weight=6, parameters={}),
+        ConstraintRule("weekend_comp_auto", "Auto-kompledighet efter helgjour", "fairness",
+                       is_hard=False, weight=7, parameters={"comp_day_offset": 1}),
     ]
 
 
@@ -826,3 +895,4 @@ if __name__ == "__main__":
     print(f"Klinik: {g.name}")
     print(f"Sites: {g.sites}")
     print(f"Läkare: {len(g.doctors)}, Salar: {len(g.operating_rooms)}")
+
