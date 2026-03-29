@@ -401,7 +401,21 @@ async def init_auth(db) -> None:
             pass  # Skadad rad — hoppa över
 
     if _username_to_id:
-        # Användare finns redan — inget att initiera
+        # Användare finns redan — men tillämpa COP_ADMIN_PASSWORD om den är satt
+        admin_pwd_env = os.getenv("COP_ADMIN_PASSWORD")
+        if admin_pwd_env:
+            try:
+                admin_uid = _username_to_id.get("admin")
+                if admin_uid:
+                    cached = _cache_get(admin_uid)
+                    if cached:
+                        cached.hashed_password = hash_password(admin_pwd_env)
+                        cached.password_change_required = False
+                        await db.save_user(cached.model_dump())
+                        _cache_set(cached)
+                        print("[COP AUTH] Admin-lösenord uppdaterat från COP_ADMIN_PASSWORD")
+            except Exception as e:
+                print(f"[COP AUTH] Kunde inte uppdatera admin-lösenord: {e}")
         await db.cleanup_expired_tokens()
         return
 
