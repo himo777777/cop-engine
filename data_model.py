@@ -702,6 +702,15 @@ def config_to_dict(config: ClinicConfig) -> dict:
                 "competencies": d.competencies,
                 "required_procedures": d.required_procedures,
                 "completed_procedures": d.completed_procedures,
+                # Avancerad schemaläggning
+                "schedule_pattern": d.schedule_pattern,
+                "fixed_weekdays": d.fixed_weekdays,
+                "min_shifts_per_week": d.min_shifts_per_week,
+                "max_shifts_per_week": d.max_shifts_per_week,
+                "half_day_schedule": d.half_day_schedule,
+                "current_rotation_block": d.current_rotation_block,
+                "recurring_activities": d.recurring_activities,
+                "work_days_per_week": d.work_days_per_week,
             } for d in config.doctors
         ],
         "operating_rooms": [
@@ -798,6 +807,15 @@ def dict_to_config(data: dict) -> ClinicConfig:
             competencies=d.get("competencies", []),
             required_procedures=d.get("required_procedures", {}),
             completed_procedures=d.get("completed_procedures", {}),
+            # Avancerad schemaläggning
+            schedule_pattern=d.get("schedule_pattern", "weekly"),
+            fixed_weekdays=d.get("fixed_weekdays", {}),
+            min_shifts_per_week=d.get("min_shifts_per_week", {}),
+            max_shifts_per_week=d.get("max_shifts_per_week", {}),
+            half_day_schedule=d.get("half_day_schedule", {}),
+            current_rotation_block=d.get("current_rotation_block", {}),
+            recurring_activities=d.get("recurring_activities", []),
+            work_days_per_week=d.get("work_days_per_week"),
         ) for d in data.get("doctors", [])
     ]
     rooms = [

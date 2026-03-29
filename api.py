@@ -203,6 +203,15 @@ class DoctorInput(BaseModel):
     exempt_from_call: bool = False
     supervisor_id: Optional[str] = None
     site_preference: Optional[str] = None
+    # Avancerad schemaläggning
+    schedule_pattern: str = "weekly"
+    fixed_weekdays: Optional[dict] = None
+    min_shifts_per_week: Optional[dict] = None
+    max_shifts_per_week: Optional[dict] = None
+    half_day_schedule: Optional[dict] = None
+    current_rotation_block: Optional[dict] = None
+    recurring_activities: Optional[list] = None
+    work_days_per_week: Optional[int] = None
 
 
 class ConfigUpdate(BaseModel):
