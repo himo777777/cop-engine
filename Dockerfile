@@ -23,4 +23,4 @@ ENV PYTHONUNBUFFERED=1 \
 USER cop
 EXPOSE ${PORT}
 
-CMD uvicorn api:app --host 0.0.0.0 --port $PORT --workers 2
+CMD uvicorn api:app --host 0.0.0.0 --port $PORT --workers 1

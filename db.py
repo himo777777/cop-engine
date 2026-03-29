@@ -129,42 +129,16 @@ CREATE INDEX IF NOT EXISTS idx_ai_chat_clinic ON ai_chat_history(clinic_id, crea
 CREATE INDEX IF NOT EXISTS idx_ai_pred_clinic ON ai_predictions(clinic_id);
 
 -- Migration: ensure ALL users columns exist (old schemas may miss any of these)
-DO $$ BEGIN
-  ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
-EXCEPTION WHEN duplicate_column THEN NULL;
-END $$;
-DO $$ BEGIN
-  ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT;
-EXCEPTION WHEN duplicate_column THEN NULL;
-END $$;
-DO $$ BEGIN
-  ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'viewer';
-EXCEPTION WHEN duplicate_column THEN NULL;
-END $$;
-DO $$ BEGIN
-  ALTER TABLE users ADD COLUMN IF NOT EXISTS doctor_id TEXT;
-EXCEPTION WHEN duplicate_column THEN NULL;
-END $$;
-DO $$ BEGIN
-  ALTER TABLE users ADD COLUMN IF NOT EXISTS hashed_password TEXT NOT NULL DEFAULT '';
-EXCEPTION WHEN duplicate_column THEN NULL;
-END $$;
-DO $$ BEGIN
-  ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;
-EXCEPTION WHEN duplicate_column THEN NULL;
-END $$;
-DO $$ BEGIN
-  ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
-EXCEPTION WHEN duplicate_column THEN NULL;
-END $$;
-DO $$ BEGIN
-  ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ;
-EXCEPTION WHEN duplicate_column THEN NULL;
-END $$;
-DO $$ BEGIN
-  ALTER TABLE users ADD COLUMN IF NOT EXISTS password_change_required BOOLEAN DEFAULT FALSE;
-EXCEPTION WHEN duplicate_column THEN NULL;
-END $$;
+-- Using EXCEPTION WHEN OTHERS to catch any error, not just duplicate_column
+DO $$ BEGIN ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'viewer'; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN ALTER TABLE users ADD COLUMN IF NOT EXISTS doctor_id TEXT; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN ALTER TABLE users ADD COLUMN IF NOT EXISTS hashed_password TEXT DEFAULT ''; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW(); EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN ALTER TABLE users ADD COLUMN IF NOT EXISTS password_change_required BOOLEAN DEFAULT FALSE; EXCEPTION WHEN OTHERS THEN NULL; END $$;
 
 -- Migration: byt namn på token → token_hash i revoked_tokens (lagrar SHA-256-hash)
 DO $$ BEGIN
@@ -213,13 +187,33 @@ async def connect_db():
         return False
     try:
         import asyncpg
-        _pool = await asyncpg.create_pool(
-            DATABASE_URL, min_size=5, max_size=20, command_timeout=30
+        import asyncio
+        # Use min_size=1 to avoid blocking on multiple connections at startup.
+        # timeout=15 ensures we fail fast if PostgreSQL is unreachable.
+        _pool = await asyncio.wait_for(
+            asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=1,
+                max_size=10,
+                command_timeout=15,
+                timeout=10,           # per-connection acquisition timeout
+            ),
+            timeout=20,  # total timeout for pool creation
         )
-        async with _pool.acquire() as conn:
-            await conn.execute(SCHEMA_SQL)
-        logger.info("PostgreSQL ansluten (pool min=5 max=20), tabeller skapade")
+        # Run schema migrations separately so pool survives even if migrations fail
+        try:
+            async with _pool.acquire() as conn:
+                await asyncio.wait_for(conn.execute(SCHEMA_SQL), timeout=30)
+            logger.info("PostgreSQL ansluten (pool min=1 max=10), schema OK")
+        except asyncio.TimeoutError:
+            logger.warning("Schema-migration timeout (30s) — appen fortsätter utan migration")
+        except Exception as schema_err:
+            logger.warning("Schema-migration hade problem (appen fortsätter): %s", schema_err)
         return True
+    except asyncio.TimeoutError:
+        logger.error("PostgreSQL pool creation timeout (20s) — faller tillbaka till in-memory")
+        _pool = None
+        return False
     except Exception as e:
         logger.error("PostgreSQL anslutning misslyckades: %s", e, exc_info=True)
         _pool = None

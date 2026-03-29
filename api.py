@@ -226,22 +226,47 @@ START_TIME = time.time()
 
 @app.on_event("startup")
 async def startup():
-    """Anslut till PostgreSQL och ladda demo-konfiguration om COP_DEMO=true."""
-    db_ok = await connect_db()
-    backend = "PostgreSQL" if db_ok else "in-memory"
+    """Anslut till PostgreSQL och ladda demo-konfiguration om COP_DEMO=true.
 
-    from auth import init_auth
-    await init_auth(db)
+    Total startup budget: 60 s.  Varje steg har sin egen timeout så att
+    appen ALLTID når health-check inom Railways 5-minutersgräns.
+    """
+    import asyncio
 
-    demo_mode = os.environ.get("COP_DEMO", "true").lower() in ("true", "1", "yes")
+    # --- 1. Database connection (max 20 s via connect_db internals) ---
+    try:
+        db_ok = await asyncio.wait_for(connect_db(), timeout=30)
+    except asyncio.TimeoutError:
+        print('[STARTUP] connect_db timeout (30 s) -- falling back to in-memory')
+        db_ok = False
+    except Exception as exc:
+        print(f'[STARTUP] connect_db error: {exc} -- falling back to in-memory')
+        db_ok = False
+
+    backend = 'PostgreSQL' if db_ok else 'in-memory'
+
+    # --- 2. Auth init (max 15 s) ---
+    try:
+        from auth import init_auth
+        await asyncio.wait_for(init_auth(db), timeout=15)
+    except asyncio.TimeoutError:
+        print('[STARTUP] init_auth timeout (15 s) -- continuing without cached users')
+    except Exception as exc:
+        print(f'[STARTUP] init_auth error: {exc} -- continuing anyway')
+
+    # --- 3. Demo configs (max 10 s) ---
+    demo_mode = os.environ.get('COP_DEMO', 'true').lower() in ('true', '1', 'yes')
     if demo_mode:
-        config = create_kristianstad_example()
-        await db.save_config("kristianstad", config)
-        generic = create_generic_example()
-        await db.save_config("generic", generic)
-        print(f"Ã¢ÂÂ COP API startad. Backend: {backend}. Demo-konfigurationer laddade (kristianstad, generic).")
-    else:
-        print(f"Ã¢ÂÂ COP API startad. Backend: {backend}. Inga demo-konfigurationer (COP_DEMO=false).")
+        try:
+            config = create_kristianstad_example()
+            await asyncio.wait_for(db.save_config('kristianstad', config), timeout=5)
+            generic = create_generic_example()
+            await asyncio.wait_for(db.save_config('generic', generic), timeout=5)
+        except Exception as exc:
+            print(f'[STARTUP] demo config error: {exc} -- continuing without demo data')
+
+    print(f'[STARTUP] COP API ready. Backend: {backend}. Demo: {demo_mode}.')
+
 
 @app.on_event("shutdown")
 async def shutdown():
