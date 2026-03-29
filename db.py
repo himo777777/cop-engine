@@ -233,6 +233,47 @@ async def connect_db():
                 except Exception as col_err:
                     logger.warning("Kolumn-migration %s.%s: %s", tbl, col, col_err)
 
+        # Verify via information_schema which columns actually exist.
+        # If any required users columns are missing, drop and recreate the table.
+        # Safe because default users are always regenerated at startup anyway.
+        _REQUIRED_USERS_COLS = {
+            "user_id", "username", "email", "full_name", "role",
+            "doctor_id", "hashed_password", "is_active",
+            "created_at", "last_login", "password_change_required",
+        }
+        try:
+            async with _pool.acquire() as verify_conn:
+                rows = await verify_conn.fetch(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'users'"
+                )
+                existing = {r["column_name"] for r in rows}
+                missing = _REQUIRED_USERS_COLS - existing
+                print(f"[DB] users columns present: {sorted(existing)}")
+                if missing:
+                    print(f"[DB] MISSING columns: {missing} — recreating users table")
+                    await verify_conn.execute(
+                        "DROP TABLE IF EXISTS users CASCADE;"
+                        "CREATE TABLE users ("
+                        "  user_id TEXT PRIMARY KEY,"
+                        "  username TEXT UNIQUE NOT NULL,"
+                        "  email TEXT,"
+                        "  full_name TEXT,"
+                        "  role TEXT NOT NULL DEFAULT 'viewer',"
+                        "  doctor_id TEXT,"
+                        "  hashed_password TEXT NOT NULL DEFAULT '',"
+                        "  is_active BOOLEAN DEFAULT TRUE,"
+                        "  created_at TIMESTAMPTZ DEFAULT NOW(),"
+                        "  last_login TIMESTAMPTZ,"
+                        "  password_change_required BOOLEAN DEFAULT FALSE"
+                        ");"
+                    )
+                    print("[DB] users table recreated with full schema")
+                else:
+                    print("[DB] users table schema OK — all columns present")
+        except Exception as verify_err:
+            print(f"[DB] users table verify/recreate error: {verify_err}")
+
         return True
     except asyncio.TimeoutError:
         logger.error("PostgreSQL pool creation timeout (20s) — faller tillbaka till in-memory")
@@ -550,6 +591,7 @@ class CopDatabase:
                         user_data.get("is_active", True),
                         user_data.get("password_change_required", False))
         except Exception as e:
+            print(f"[DB] save_user ACTUAL ERROR for {uid}: {type(e).__name__}: {e}")
             logger.error("save_user misslyckades", extra={"error": str(e), "user_id": uid})
             raise HTTPException(503, "Databasen är temporärt otillgänglig")
         return uid
