@@ -101,6 +101,26 @@ class Doctor:
     # {"block_type": "AVD_CSK", "start_date": "2026-04-01", "end_date": "2026-06-30"}
     current_rotation_block: dict = field(default_factory=dict)
 
+    # AT-rotation: fast veckoschema per veckodag
+    # {"monday": "AKUT", "tuesday": "AKUT", "wednesday": "TRAUMA", "thursday": "MOTT", "friday": "AVD"}
+    at_weekly_rotation: dict = field(default_factory=dict)
+
+    # AT-rotationsperiod: {"start_date": "2026-04-01", "end_date": "2026-09-30", "supervisor": "Dr X"}
+    at_rotation_period: dict = field(default_factory=dict)
+
+    # ST-randning: perioder då ST är på annan klinik
+    # [{"klinik": "Handkirurgi SUS", "start_date": "2026-05-01", "end_date": "2026-06-30"}]
+    st_randning: list = field(default_factory=list)
+
+    # ST minsta OP-dagar per vecka (None = inget krav)
+    st_min_op_days: Optional[int] = None
+
+    # ST krav på OP-typer: ["HOFT_PRIMA", "KNA_PRIMA", "FRAKTUR"]
+    st_required_op_types: list = field(default_factory=list)
+
+    # ST procedurmål: {"HOFT_PRIMA": {"goal": 20, "done": 5}, "KNA_PRIMA": {"goal": 15, "done": 3}}
+    st_target_procedures: dict = field(default_factory=dict)
+
     # Fasta återkommande aktiviteter: [{"weekday": "tuesday", "time": "10:00-11:00", "activity": "Infektionsrond"}]
     recurring_activities: list = field(default_factory=list)
 
@@ -289,6 +309,12 @@ def default_constraint_rules() -> list[ConstraintRule]:
         ConstraintRule("continuity_of_care", "Kontinuitetskrav (COC)", "quality",
                        is_hard=False, weight=3,
                        description="Gruppera mottagningsdagar (MOTT) konsekutivt per läkare per vecka — undviker glapp"),
+        ConstraintRule("at_weekly_rotation", "AT-rotation veckoschema", "staffing",
+                       is_hard=True, weight=10,
+                       description="AT-läkare placeras enligt fast veckoschema: t.ex. 1 dag trauma, 2 dagar akut, 1 dag mott"),
+        ConstraintRule("st_op_requirement", "ST minsta OP-dagar/vecka", "fairness",
+                       is_hard=False, weight=5,
+                       description="ST-läkare garanteras konfigurerat minimiantal OP-dagar per vecka för utbildningsmål"),
     ]
 
 

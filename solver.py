@@ -752,6 +752,95 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
                     model.add(gap >= 0)
                     coc_penalty_terms.append(gap)
 
+    # === CONSTRAINT 25: AT-rotation — Fasta veckodagar per funktion ===
+    at_rotation_penalty = []
+    for doc in config.doctors:
+        rotation = getattr(doc, 'at_weekly_rotation', None)
+        if not rotation:
+            continue
+        rotation_period = getattr(doc, 'at_rotation_period', {})
+        rot_start = rotation_period.get('start_date')
+        rot_end = rotation_period.get('end_date')
+
+        weekday_map = {'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3, 'friday': 4}
+
+        for day in range(num_days):
+            date = start_date + timedelta(days=day)
+            # Check if day is within rotation period
+            if rot_start and str(date) < rot_start:
+                continue
+            if rot_end and str(date) > rot_end:
+                continue
+
+            weekday_idx = date.weekday()  # 0=monday
+            if weekday_idx >= 5:
+                continue  # skip weekends
+
+            weekday_name = list(weekday_map.keys())[weekday_idx]
+            required_func = rotation.get(weekday_name)
+            if not required_func:
+                continue
+
+            # Hard constraint: doc must be on this function on this day
+            if (doc.id, day, required_func) in x:
+                model.add(x[(doc.id, day, required_func)] == 1)
+            else:
+                # If the function doesn't exist, penalize
+                for func_id in day_functions:
+                    fid = func_id if isinstance(func_id, str) else func_id[0]
+                    if (doc.id, day, fid) in x and fid == required_func:
+                        model.add(x[(doc.id, day, fid)] == 1)
+                        break
+    print(f"  AT-rotation constraints applied for {sum(1 for d in config.doctors if getattr(d, 'at_weekly_rotation', None))} doctors")
+
+    # === CONSTRAINT 26: ST OP-krav — Minsta antal OP-dagar per vecka ===
+    st_op_penalty = []
+    for doc in config.doctors:
+        min_op = getattr(doc, 'st_min_op_days', None)
+        if not min_op or min_op <= 0:
+            continue
+
+        # Check randning (absent periods)
+        randning_periods = getattr(doc, 'st_randning', [])
+
+        for week in range(num_weeks):
+            ws = week * 7
+            # Check if this week overlaps with a randning period
+            week_start_date = start_date + timedelta(days=ws)
+            in_randning = False
+            for rp in randning_periods:
+                if rp.get('start_date') and rp.get('end_date'):
+                    if rp['start_date'] <= str(week_start_date) <= rp['end_date']:
+                        in_randning = True
+                        break
+            if in_randning:
+                continue  # Skip weeks when ST is on randning
+
+            # Count OP days this week (weekdays only)
+            op_days = []
+            for d_offset in range(min(5, num_days - ws)):
+                day = ws + d_offset
+                day_op_vars = []
+                for func_id in day_functions:
+                    fid = func_id if isinstance(func_id, str) else func_id[0]
+                    if fid.startswith("OP") and (doc.id, day, fid) in x:
+                        day_op_vars.append(x[(doc.id, day, fid)])
+                if day_op_vars:
+                    has_op = model.new_bool_var(f"st_op_{doc.id}_w{week}_d{d_offset}")
+                    model.add(sum(day_op_vars) >= 1).only_enforce_if(has_op)
+                    model.add(sum(day_op_vars) == 0).only_enforce_if(has_op.negated())
+                    op_days.append(has_op)
+
+            if op_days:
+                # Soft constraint: penalize if fewer than min_op OP days
+                op_count = model.new_int_var(0, 5, f"st_opcount_{doc.id}_w{week}")
+                model.add(op_count == sum(op_days))
+                deficit = model.new_int_var(0, 5, f"st_opdef_{doc.id}_w{week}")
+                model.add(deficit >= min_op - op_count)
+                model.add(deficit >= 0)
+                st_op_penalty.append(deficit)
+    print(f"  ST OP-krav constraints applied for {sum(1 for d in config.doctors if getattr(d, 'st_min_op_days', None))} doctors")
+
     # === DETAILED RULES (avancerad regelmotor) ===
     rule_objective_terms = []
     if getattr(config, 'detailed_rules', None):
@@ -928,6 +1017,10 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
     # Semesterblock (mjuka önskemål)
     for sv in semester_bonus:
         objective_terms.append(3 * sv)
+    # ST OP-krav: penalize deficit of OP days
+    w_st_op = _rule_weight(config, "st_op_requirement", 5)
+    for deficit_var in st_op_penalty:
+        objective_terms.append(-w_st_op * deficit_var)
 
     # OB-kostnadsrättvisa
     if config.optimize_ob_cost:
