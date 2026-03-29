@@ -260,6 +260,31 @@ async def connect_db():
                 logger.warning("Kunde inte lägga till jobs.data: %s", _col_err)
             print("[DB] jobs table schema ensured")
 
+            # Fix schedules table: drop legacy week column (NOT NULL, blocks INSERT)
+            # and ensure updated_at column exists (referenced in save_schedule SQL).
+            try:
+                await mig_conn.execute(
+                    "ALTER TABLE schedules DROP COLUMN IF EXISTS week;"
+                )
+                print("[DB] Legacy schedules.week column dropped (if it existed)")
+            except Exception as _drop_err:
+                logger.warning("Kunde inte droppa schedules.week: %s", _drop_err)
+            try:
+                await mig_conn.execute(
+                    "ALTER TABLE schedules ADD COLUMN IF NOT EXISTS updated_at "
+                    "TIMESTAMPTZ DEFAULT NOW();"
+                )
+                print("[DB] schedules.updated_at column ensured")
+            except Exception as _col_err:
+                logger.warning("Kunde inte lägga till schedules.updated_at: %s", _col_err)
+            # Fix schedules.clinic_id — allow NULL in case clinic_id is missing
+            try:
+                await mig_conn.execute(
+                    "ALTER TABLE schedules ALTER COLUMN clinic_id DROP NOT NULL;"
+                )
+            except Exception as _nn_err:
+                logger.warning("Kunde inte ändra schedules.clinic_id nullability: %s", _nn_err)
+
         # Verify via information_schema which columns actually exist.
         # If any required users columns are missing, drop and recreate the table.
         # Safe because default users are always regenerated at startup anyway.
