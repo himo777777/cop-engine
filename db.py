@@ -128,25 +128,39 @@ CREATE INDEX IF NOT EXISTS idx_ai_rules_clinic ON ai_rules(clinic_id);
 CREATE INDEX IF NOT EXISTS idx_ai_chat_clinic ON ai_chat_history(clinic_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_ai_pred_clinic ON ai_predictions(clinic_id);
 
--- Migration: email i users (saknades i äldre schema)
+-- Migration: ensure ALL users columns exist (old schemas may miss any of these)
 DO $$ BEGIN
   ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
 EXCEPTION WHEN duplicate_column THEN NULL;
 END $$;
-
--- Migration: full_name i users
 DO $$ BEGIN
   ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT;
 EXCEPTION WHEN duplicate_column THEN NULL;
 END $$;
-
--- Migration: doctor_id i users
+DO $$ BEGIN
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'viewer';
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
 DO $$ BEGIN
   ALTER TABLE users ADD COLUMN IF NOT EXISTS doctor_id TEXT;
 EXCEPTION WHEN duplicate_column THEN NULL;
 END $$;
-
--- Migration: password_change_required i users
+DO $$ BEGIN
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS hashed_password TEXT NOT NULL DEFAULT '';
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+DO $$ BEGIN
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+DO $$ BEGIN
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+DO $$ BEGIN
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
 DO $$ BEGIN
   ALTER TABLE users ADD COLUMN IF NOT EXISTS password_change_required BOOLEAN DEFAULT FALSE;
 EXCEPTION WHEN duplicate_column THEN NULL;
