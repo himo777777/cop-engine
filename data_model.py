@@ -286,6 +286,9 @@ def default_constraint_rules() -> list[ConstraintRule]:
         ConstraintRule("min_senior_coverage", "Minimum seniorbeläggning per vecka", "staffing",
                        is_hard=True, weight=10,
                        description="Minst 50% av seniora läkare (ÖL + SP) måste vara schemalagda varje vecka"),
+        ConstraintRule("continuity_of_care", "Kontinuitetskrav (COC)", "quality",
+                       is_hard=False, weight=3,
+                       description="Gruppera mottagningsdagar (MOTT) konsekutivt per läkare per vecka — undviker glapp"),
     ]
 
 

@@ -712,6 +712,46 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
         if week_senior_work:
             model.add(sum(week_senior_work) >= min_senior_per_week)
 
+    # === CONSTRAINT 24: Kontinuitetskrav (COC) — Gruppera MOTT-dagar per läkare per vecka ===
+    # Om en läkare har mottagning (MOTT_*) under en vecka, försök samla dem
+    # på konsekutiva dagar istället för utspridda. Mjukt constraint via penalty.
+    mott_functions = [f for f in day_functions if f.startswith("MOTT")]
+    coc_penalty_terms = []
+
+    for doc in config.doctors:
+        pattern = getattr(doc, 'schedule_pattern', 'weekly')
+        for week in range(num_weeks):
+            if pattern == 'biweekly_even' and week % 2 == 1:
+                continue
+            if pattern == 'biweekly_odd' and week % 2 == 0:
+                continue
+
+            # Collect MOTT assignments for Mon-Fri this week
+            week_mott = []
+            for d_offset in range(5):
+                day = week * 7 + d_offset
+                if day >= num_days:
+                    break
+                day_mott_vars = []
+                for f in mott_functions:
+                    if (doc.id, day, f) in x:
+                        day_mott_vars.append(x[(doc.id, day, f)])
+                if day_mott_vars:
+                    has_mott = model.new_bool_var(f"mott_{doc.id}_w{week}_d{d_offset}")
+                    model.add(has_mott <= sum(day_mott_vars))
+                    model.add(has_mott >= sum(day_mott_vars) - len(day_mott_vars) + 1)
+                    week_mott.append(has_mott)
+
+            # Penalize gaps between MOTT days (non-consecutive pattern)
+            # For each pair of non-adjacent MOTT days, add a penalty
+            if len(week_mott) >= 3:
+                for i in range(len(week_mott) - 2):
+                    # If day i has MOTT and day i+2 has MOTT but day i+1 doesn't → gap penalty
+                    gap = model.new_bool_var(f"mott_gap_{doc.id}_w{week}_{i}")
+                    model.add(gap >= week_mott[i] + week_mott[i+2] - week_mott[i+1] - 1)
+                    model.add(gap >= 0)
+                    coc_penalty_terms.append(gap)
+
     # === DETAILED RULES (avancerad regelmotor) ===
     rule_objective_terms = []
     if getattr(config, 'detailed_rules', None):
@@ -919,6 +959,11 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
 
     # Lägg till regelmotor-termer
     objective_terms.extend(rule_objective_terms)
+
+    # COC-penalty (Constraint 24): Straffa glapp i mottagningsdagar
+    if coc_penalty_terms:
+        w_coc = _rule_weight(config, "continuity_of_care", 3)
+        objective_terms.append(-w_coc * sum(coc_penalty_terms))
 
     if objective_terms:
         model.maximize(sum(objective_terms))
