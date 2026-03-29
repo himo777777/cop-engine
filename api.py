@@ -1481,8 +1481,28 @@ async def run_absence_chain(request: AbsenceChainRequest):
         auto_select=request.auto_select,
     )
 
-    # Spara resultat
+    # Spara resultat — både in-memory (för session) och PostgreSQL (persistent)
     absence_chain_store[result.chain_id] = result
+    chain_dict = {
+        "chain_id": result.chain_id,
+        "absence_type": result.absence_type,
+        "doctor_id": result.doctor_id,
+        "doctor_name": result.doctor_name,
+        "start_date": result.start_date,
+        "end_date": result.end_date,
+        "status": result.status.value,
+        "vacant_slots": result.vacant_slots,
+        "replacements": result.replacements,
+        "failed_slots": result.failed_slots,
+        "chain_log": result.chain_log,
+        "notifications": result.notifications,
+        "atl_violations": result.atl_violations,
+        "schedule_changes": result.schedule_changes,
+    }
+    try:
+        await db.save_chain(chain_dict)
+    except Exception as _chain_err:
+        logger.warning("Kunde inte spara frånvarokedja till DB: %s", _chain_err)
 
     # WebSocket broadcast: frÃÂ¥nvarokedja
     if HAS_WS:
@@ -1637,7 +1657,23 @@ async def manual_replacement(request: ManualReplacementRequest):
 
 @app.get("/absence/chains", tags=["FrÃÂ¥nvarokedja"])
 async def list_absence_chains(status: Optional[str] = None):
-    """Lista alla kÃÂ¶rda frÃÂ¥nvarokedjor."""
+    """Lista alla körda frånvarokedjor (läses från PostgreSQL)."""
+    # Hämta från DB (persistent)
+    db_chains = await db.list_chains(status=status)
+    if db_chains:
+        return [
+            {
+                "chain_id": c.get("chain_id"),
+                "doctor": f"{c.get('doctor_name','')} ({c.get('doctor_id','')})",
+                "absence_type": c.get("absence_type"),
+                "period": f"{c.get('start_date','')} — {c.get('end_date','')}",
+                "status": c.get("status"),
+                "replaced": len(c.get("schedule_changes", [])),
+                "failed": len(c.get("failed_slots", [])),
+            }
+            for c in db_chains
+        ]
+    # Fallback: in-memory (för denna session)
     results = []
     for chain_id, result in absence_chain_store.items():
         if status and result.status.value != status:
@@ -1646,7 +1682,7 @@ async def list_absence_chains(status: Optional[str] = None):
             "chain_id": result.chain_id,
             "doctor": f"{result.doctor_name} ({result.doctor_id})",
             "absence_type": result.absence_type,
-            "period": f"{result.start_date} Ã¢ÂÂ {result.end_date}",
+            "period": f"{result.start_date} — {result.end_date}",
             "status": result.status.value,
             "replaced": len(result.schedule_changes),
             "failed": len(result.failed_slots),
