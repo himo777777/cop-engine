@@ -619,8 +619,8 @@ def _compute_statistics(schedule: dict, config: ClinicConfig, num_days: int) -> 
 
     # JourfÃÂ¶rdelning
     for doc in config.doctors:
-        primary = sum(1 for d in range(num_days) if schedule.get(doc.id, {}).get(d) == "JOUR_P")
-        backup = sum(1 for d in range(num_days) if schedule.get(doc.id, {}).get(d) == "JOUR_B")
+        primary = sum(1 for d in range(num_days) if "JOUR_P" in str(schedule.get(doc.id, {}).get(d, "")))
+        backup = sum(1 for d in range(num_days) if "JOUR_B" in str(schedule.get(doc.id, {}).get(d, "")))
         if primary + backup > 0:
             stats["call_distribution"][doc.id] = {
                 "name": doc.name,
@@ -916,8 +916,8 @@ def _validate_single_day(schedule: dict, config: ClinicConfig, day: int) -> list
         return v
 
     # Kolla att jour finns
-    primary = [d_id for d_id, days in schedule.items() if _get(days, day) == "JOUR_P"]
-    backup = [d_id for d_id, days in schedule.items() if _get(days, day) == "JOUR_B"]
+    primary = [d_id for d_id, days in schedule.items() if "JOUR_P" in str(_get(days, day) or "")]
+    backup = [d_id for d_id, days in schedule.items() if "JOUR_B" in str(_get(days, day) or "")]
 
     if len(primary) != 1:
         warnings.append(f"Dag {day}: {len(primary)} primÃÂ¤rjourer (ska vara 1)")
@@ -1209,8 +1209,8 @@ async def validate_schedule(schedule_id: str):
         if weekday >= 5:
             continue
 
-        primary = sum(1 for d_id in raw if raw[d_id].get(day) == "JOUR_P")
-        backup = sum(1 for d_id in raw if raw[d_id].get(day) == "JOUR_B")
+        primary = sum(1 for d_id in raw if "JOUR_P" in str(raw[d_id].get(day) or ""))
+        backup = sum(1 for d_id in raw if "JOUR_B" in str(raw[d_id].get(day) or ""))
 
         if primary != 1:
             violations.append({
@@ -2138,7 +2138,7 @@ async def get_dashboard(clinic_id: str = "kristianstad"):
         },
         "warnings": warnings,
         "statistics": {
-            "total_calls": sum(1 for days in raw.values() for f in days.values() if f in ("JOUR_P", "JOUR_B")),
+            "total_calls": sum(1 for days in raw.values() for f in days.values() if "JOUR_P" in str(f) or "JOUR_B" in str(f)),
             "op_utilization": 0.85,
         },
         "pending": {
