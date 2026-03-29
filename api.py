@@ -1166,6 +1166,23 @@ async def validate_schedule(schedule_id: str):
 
     config = await db.get_config(sched["clinic_id"])
     raw = sched.get("raw_schedule", {})
+
+    # Konvertera schedule (datumsnycklar) → raw_schedule (int-index) om det saknas
+    if not raw and sched.get("schedule"):
+        _start = date.fromisoformat(sched["start_date"])
+        _num = sched["num_weeks"] * 7
+        raw = {}
+        for _doc_id, _days in sched["schedule"].items():
+            raw[_doc_id] = {}
+            for _date_str, _shift in _days.items():
+                try:
+                    _d = date.fromisoformat(_date_str)
+                    _idx = (_d - _start).days
+                    if 0 <= _idx < _num:
+                        raw[_doc_id][_idx] = _shift
+                except (ValueError, TypeError):
+                    pass
+
     num_days = sched["num_weeks"] * 7
 
     violations = []
