@@ -276,35 +276,6 @@ async def shutdown():
 
 # === HEALTH & INFO ===
 
-@app.get("/debug/tables", tags=["System"])
-async def debug_tables():
-    """Temporärt: visa schema och INSERT-test för alla tabeller."""
-    import db as db_module, json as _json
-    res = {"pool": db_module._pool is not None}
-    if not db_module._pool:
-        return res
-    try:
-        async with db_module._pool.acquire() as conn:
-            cols = await conn.fetch(
-                "SELECT table_name, column_name, data_type, is_nullable "
-                "FROM information_schema.columns "
-                "WHERE table_name IN ('jobs','users','schedules','clinic_configs') "
-                "ORDER BY table_name, ordinal_position")
-            res["columns"] = [dict(c) for c in cols]
-            # Test INSERT into jobs
-            try:
-                await conn.execute(
-                    "INSERT INTO jobs (job_id, data) VALUES ($1, $2) "
-                    "ON CONFLICT (job_id) DO NOTHING",
-                    "_dbg_test", _json.dumps({"test": True}))
-                await conn.execute("DELETE FROM jobs WHERE job_id='_dbg_test'")
-                res["jobs_insert"] = "OK"
-            except Exception as e:
-                res["jobs_insert_error"] = f"{type(e).__name__}: {e}"
-    except Exception as e:
-        res["error"] = f"{type(e).__name__}: {e}"
-    return res
-
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 async def health_check():
