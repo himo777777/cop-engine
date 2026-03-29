@@ -327,16 +327,10 @@ def default_constraint_rules() -> list[ConstraintRule]:
         ConstraintRule("st_op_requirement", "ST minsta OP-dagar/vecka", "fairness",
                        is_hard=False, weight=5,
                        description="ST-läkare garanteras konfigurerat minimiantal OP-dagar per vecka för utbildningsmål"),
-        ConstraintRule("backup_call_coverage", "Bakjourslinje dygnet runt", "staffing",
-                       is_hard=True, weight=10,
-                       description="Bakjourslinje alltid bemannad med senior (ÖL/SP), respekterar max per månad och preferensdagar"),
-        ConstraintRule("consultation_schedule", "Konsultschema", "quality",
-                       is_hard=False, weight=6,
-                       description="Seniora läkare placeras på konsultfunktion enligt konfigurerat veckoschema"),
-        ConstraintRule("op_senior_junior_pair", "Senior/junior-par på OP", "staffing",
-                       is_hard=True, weight=10,
-                       description="Junior (AT/ST) på OP måste paras med senior (SP/ÖL) samma dag samma sal"),
     ]
+    # OBS: Bakjourslinje, konsultschema och senior/junior OP-parning är INTE
+    # togglebara klinik-regler. De är inbyggd solver-kunskap som alltid är aktiv
+    # och styrs per läkare via Doctor-fälten backup_call_config, consultation_schedule, op_pairing.
 
 
 @dataclass
