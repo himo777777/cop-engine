@@ -1472,6 +1472,22 @@ async def run_absence_chain(request: AbsenceChainRequest):
     raw = sched.get("raw_schedule", {})
     start = date.fromisoformat(sched["start_date"])
 
+    # Om raw_schedule saknas (äldre schema-format), konvertera från schedule (datumsnycklar → int-index)
+    if not raw and sched.get("schedule"):
+        sched_data = sched["schedule"]
+        num_days = sched["num_weeks"] * 7
+        raw = {}
+        for doc_id, days in sched_data.items():
+            raw[doc_id] = {}
+            for date_str, shift in days.items():
+                try:
+                    d = date.fromisoformat(date_str)
+                    day_idx = (d - start).days
+                    if 0 <= day_idx < num_days:
+                        raw[doc_id][day_idx] = shift
+                except (ValueError, TypeError):
+                    pass
+
     chain = AbsenceChain(config, raw, start, sched["num_weeks"])
     result = chain.execute(
         doctor_id=request.doctor_id,
@@ -1959,12 +1975,27 @@ from op_planning import op_planner, Operation
 from jour_report import jour_reporter
 
 
-@app.get("/payroll/generate", tags=["Löneunderlag"])
-async def generate_payroll(clinic_id: str = "kristianstad", start: str = "2026-04-06", end: str = "2026-04-19"):
+async def _resolve_payroll_config_and_schedule(clinic_id: str):
+    """Hjälpfunktion: hitta config och senaste schema för löneutdata.
+    Fallback-kedja: explicit clinic_id → senaste schemat oavsett klinik."""
     config = await db.get_config(clinic_id)
+    schedules = await db.list_schedules(clinic_id=clinic_id) if config else []
+    if not schedules:
+        # Fallback: hämta senaste schema oavsett klinik och använd dess clinic_id
+        all_scheds = await db.list_schedules()
+        if all_scheds:
+            latest_any = max(all_scheds, key=lambda s: s.get("created_at", ""))
+            actual_clinic = latest_any.get("clinic_id", clinic_id)
+            config = await db.get_config(actual_clinic)
+            schedules = [latest_any]
+    return config, schedules
+
+
+@app.get("/payroll/generate", tags=["Löneunderlag"])
+async def generate_payroll(clinic_id: str = "hassleholm", start: str = "2026-04-06", end: str = "2026-04-19"):
+    config, schedules = await _resolve_payroll_config_and_schedule(clinic_id)
     if not config:
         raise HTTPException(status_code=404, detail="Klinik inte hittad")
-    schedules = await db.list_schedules(clinic_id=clinic_id)
     if not schedules:
         return {"entries": [], "summary": {}}
     latest = max(schedules, key=lambda s: s.get("created_at", ""))
@@ -1977,11 +2008,10 @@ async def generate_payroll(clinic_id: str = "kristianstad", start: str = "2026-0
 
 
 @app.get("/payroll/export", tags=["Löneunderlag"])
-async def export_payroll(clinic_id: str = "kristianstad", start: str = "2026-04-06", end: str = "2026-04-19", format: str = "csv"):
-    config = await db.get_config(clinic_id)
+async def export_payroll(clinic_id: str = "hassleholm", start: str = "2026-04-06", end: str = "2026-04-19", format: str = "csv"):
+    config, schedules = await _resolve_payroll_config_and_schedule(clinic_id)
     if not config:
         raise HTTPException(status_code=404, detail="Klinik inte hittad")
-    schedules = await db.list_schedules(clinic_id=clinic_id)
     if not schedules:
         return {"content": "", "format": format}
     latest = max(schedules, key=lambda s: s.get("created_at", ""))
@@ -1996,11 +2026,10 @@ async def export_payroll(clinic_id: str = "kristianstad", start: str = "2026-04-
 
 @app.post("/payroll/validate", tags=["Löneunderlag"])
 async def validate_payroll(body: dict = {}):
-    clinic_id = body.get("clinic_id", "kristianstad")
-    config = await db.get_config(clinic_id)
+    clinic_id = body.get("clinic_id", "hassleholm")
+    config, schedules = await _resolve_payroll_config_and_schedule(clinic_id)
     if not config:
         return {"errors": ["Klinik inte hittad"]}
-    schedules = await db.list_schedules(clinic_id=clinic_id)
     if not schedules:
         return {"errors": [], "valid": True}
     latest = max(schedules, key=lambda s: s.get("created_at", ""))
@@ -2521,4 +2550,5 @@ async def run_simulation(body: dict):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+
 
