@@ -557,6 +557,14 @@ class AIConflictRequest(BaseModel):
     clinic_id: str
     new_rule: dict
 
+class AIOnboardingRequest(BaseModel):
+    message: str
+    chat_history: list[dict] = []
+    partial_config: dict = {}
+
+class AIAnalyzeConfigRequest(BaseModel):
+    clinic_id: str
+
 @app.post("/api/ai/rules/parse", tags=["AI"])
 async def ai_parse_rule(req: AIRuleRequest):
     config = await db.get_config(req.clinic_id)
@@ -610,6 +618,65 @@ async def ai_chat_endpoint(req: AIChatRequest):
     from ai_chat import chat
     result = await chat(config, latest, req.user_id, req.message, chat_history=history, clinic_id=req.clinic_id)
     await db.save_ai_chat(req.clinic_id, req.user_id, req.message, result.get("response_sv", ""), result.get("action"))
+    return result
+
+
+# === AI ONBOARDING ===
+
+@app.post("/api/ai/onboarding", tags=["AI Onboarding"])
+async def ai_onboarding(req: AIOnboardingRequest):
+    """
+    Konversations-baserad klinik-onboarding.
+    AI:n intervjuar admin steg för steg och bygger config.
+    """
+    from ai_onboarding import onboard_step
+    result = await onboard_step(
+        message=req.message,
+        chat_history=req.chat_history,
+        partial_config=req.partial_config,
+    )
+    return result
+
+
+@app.post("/api/ai/onboarding/generate", tags=["AI Onboarding"])
+async def ai_onboarding_generate(body: dict):
+    """
+    Generera komplett ClinicConfig från onboarding-resultat.
+    Anropas när onboarding is_complete=True.
+    """
+    from ai_onboarding import generate_clinic_config
+    config = await generate_clinic_config(body)
+    return config
+
+
+@app.post("/api/ai/onboarding/save", tags=["AI Onboarding"])
+async def ai_onboarding_save(clinic_id: str, body: dict):
+    """
+    Spara en AI-genererad config som ny klinik.
+    """
+    existing = await db.get_config(clinic_id)
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Klinik '{clinic_id}' finns redan")
+    from data_model import dict_to_config
+    config = dict_to_config(body)
+    await db.save_config(clinic_id, config)
+    await db.audit("clinic_created_via_onboarding", details={"clinic_id": clinic_id})
+    return {"status": "created", "clinic_id": clinic_id}
+
+
+@app.post("/api/ai/analyze-config", tags=["AI Onboarding"])
+async def ai_analyze_config(req: AIAnalyzeConfigRequest):
+    """
+    Analysera befintlig klinikconfig och hitta saknade regler,
+    ofullständig data, inkonsistenser och förbättringsförslag.
+    """
+    config = await db.get_config(req.clinic_id)
+    if not config:
+        raise HTTPException(status_code=404, detail=f"Klinik '{req.clinic_id}' finns inte")
+    from data_model import config_to_dict
+    from ai_onboarding import analyze_config_gaps
+    config_dict = config_to_dict(config)
+    result = await analyze_config_gaps(config_dict)
     return result
 
 
