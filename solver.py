@@ -375,12 +375,20 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
         explicit_days = getattr(doc, 'work_days_per_week', None)
         if explicit_days is not None:
             max_work_per_week = explicit_days
-        elif doc.employment_rate < 1.0:
+        elif doc.employment_rate < 1.0 and doc.employment_rate > 0.0:
             max_work_per_week = int(5 * doc.employment_rate + 0.5)
         else:
-            continue  # Heltid utan explicit begränsning → hanteras av constraint 8
+            continue  # Heltid eller 0% (=ej satt) → hanteras av constraint 8
+
+        pattern = getattr(doc, 'schedule_pattern', 'weekly')
 
         for week in range(num_weeks):
+            # Hoppa över off-veckor för biweekly — de hanteras av constraint 15
+            if pattern == 'biweekly_even' and week % 2 == 1:
+                continue
+            if pattern == 'biweekly_odd' and week % 2 == 0:
+                continue
+
             week_start = week * 7
             work_vars = []
             for d in range(week_start, min(week_start + 7, num_days)):
@@ -908,11 +916,12 @@ def solve_schedule(config: ClinicConfig, num_weeks: int = 2, time_limit_seconds:
         print_schedule(schedule, config, num_days)
         print_statistics(schedule, config, num_days, solver, call_counts)
 
-        # Inkludera halvdags-metadata om det finns
+        # Returnera som tuple-safe dict — metadata separat så expand_to_granular inte kraschar
+        result = dict(schedule)
         if half_day_meta:
-            schedule["_half_day_meta"] = half_day_meta
+            result["_meta"] = {"half_day": half_day_meta}
 
-        return schedule
+        return result
     else:
         print(f"\n❌ Inget schema hittades. Status: {solver.status_name(status)}")
         return None
@@ -1051,6 +1060,8 @@ def expand_to_granular(schedule: dict, num_days: int) -> dict:
     """
     expanded = {}
     for doc_id, days in schedule.items():
+        if doc_id.startswith("_"):
+            continue  # Hoppa över metadata-nycklar
         expanded[doc_id] = {}
         for day, func_id in days.items():
             weekday = day % 7
