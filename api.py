@@ -1877,12 +1877,30 @@ async def get_absence_chain(chain_id: str):
     if not result:
         raise HTTPException(status_code=404, detail="FrÃÂ¥nvarokedja inte hittad")
 
+    # result can be either a Pydantic object or a dict (in-memory save_chain overwrites with dict)
+    if isinstance(result, dict):
+        status_val = result.get("status", "")
+        if hasattr(status_val, "value"):
+            status_val = status_val.value
+        return {
+            "chain_id": result.get("chain_id"),
+            "status": status_val,
+            "doctor": f"{result.get('doctor_name', '')} ({result.get('doctor_id', '')})",
+            "absence_type": result.get("absence_type"),
+            "period": f"{result.get('start_date')} - {result.get('end_date')}",
+            "replacements": result.get("replacements", []),
+            "failed_slots": result.get("failed_slots", []),
+            "schedule_changes": result.get("schedule_changes", []),
+            "notifications": result.get("notifications", []),
+            "chain_log": result.get("chain_log", []),
+        }
+    status_val = result.status.value if hasattr(result.status, "value") else result.status
     return {
         "chain_id": result.chain_id,
-        "status": result.status.value,
+        "status": status_val,
         "doctor": f"{result.doctor_name} ({result.doctor_id})",
         "absence_type": result.absence_type,
-        "period": f"{result.start_date} Ã¢ÂÂ {result.end_date}",
+        "period": f"{result.start_date} - {result.end_date}",
         "replacements": result.replacements,
         "failed_slots": result.failed_slots,
         "schedule_changes": result.schedule_changes,
