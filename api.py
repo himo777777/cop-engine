@@ -286,6 +286,43 @@ async def shutdown():
 # === HEALTH & INFO ===
 
 
+@app.post("/auth/reset-demo-passwords", tags=["System"])
+async def reset_demo_passwords(secret: str = "cop-reset-2026"):
+    """
+    Nollställer demo-lösenorden till standardvärdena.
+    Kräver secret-parametern för att skydda mot oavsiktlig användning.
+    Anrop: POST /auth/reset-demo-passwords?secret=cop-reset-2026
+    """
+    if secret != "cop-reset-2026":
+        raise HTTPException(status_code=403, detail="Fel secret")
+    try:
+        from auth import hash_password, UserInDB, Role as AuthRole, _cache_set
+        import secrets as _secrets
+        defaults = [
+            ("usr_admin",     "admin",     "admin@cop.local",  "COP Administrator", AuthRole.ADMIN,     "cop-admin-2026"),
+            ("usr_scheduler", "scheduler", "schema@cop.local", "Schemaläggare",     AuthRole.SCHEDULER, "schema-2026"),
+            ("usr_viewer",    "viewer",    "viewer@cop.local", "Dashboard Viewer",  AuthRole.VIEWER,    "viewer-2026"),
+        ]
+        reset = []
+        for uid, uname, email, name, role, pwd in defaults:
+            user = UserInDB(
+                user_id=uid,
+                username=uname,
+                email=email,
+                full_name=name,
+                role=role,
+                hashed_password=hash_password(pwd),
+                password_change_required=False,
+                is_active=True,
+            )
+            await db.save_user(user.model_dump())
+            _cache_set(user)
+            reset.append(uname)
+        return {"reset": reset, "message": "Lösenord nollställda till standardvärden"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Reset misslyckades: {e}")
+
+
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 async def health_check():
     """Kontrollera att API:t lever och solver fungerar."""
